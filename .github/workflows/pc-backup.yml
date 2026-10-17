@@ -33,6 +33,13 @@ jobs:
 
           ./Backup-PC.ps1 @params
 
+          # Backup-PC.ps1 shells out to robocopy/winget/pnputil, which leave
+          # $LASTEXITCODE set - robocopy returns 1 even on success. The Actions
+          # pwsh wrapper ends every step with `if (Test-Path variable:LASTEXITCODE) { exit $LASTEXITCODE }`,
+          # so a perfectly good backup would still fail this step and skip the
+          # two steps below. Clear it now that the script has returned.
+          $global:LASTEXITCODE = 0
+
           $backup = Get-ChildItem -LiteralPath $destination -Directory -Filter 'Backup_*' -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending | Select-Object -First 1
           if (-not $backup) { throw 'Backup-PC.ps1 did not produce a backup folder' }
