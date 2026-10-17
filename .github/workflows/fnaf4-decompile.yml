@@ -1,0 +1,40 @@
+name: Decompile FNaF 4
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '**.py'
+      - '.github/workflows/fnaf4-decompile.yml'
+permissions:
+  contents: read
+jobs:
+  decompile:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Setup .NET 6.0 for CTFAK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+      - name: Download FNaF 4 executable
+        shell: pwsh
+        run: |
+          Write-Host "Downloading fnaf4.exe..."
+          Invoke-WebRequest -Uri 'https://github.com/hipliteidk-glitch/rdp-runner/releases/download/Uuuu/fnaf4.exe' -OutFile 'fnaf4.exe' -UseBasicParsing -TimeoutSec 180
+          if (!(Test-Path 'fnaf4.exe') -or (Get-Item 'fnaf4.exe').Length -lt 1000) { throw 'Download failed' }
+          $sizeMB = [math]::Round((Get-Item 'fnaf4.exe').Length / 1MB, 2)
+          Write-Host "Downloaded $sizeMB MB"
+      - name: Run CTFAK decompiler
+        run: python cicdec_final.py
+      - name: Upload decompile output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnaf4-decompile-output
+          path: out/
+          if-no-files-found: warn
