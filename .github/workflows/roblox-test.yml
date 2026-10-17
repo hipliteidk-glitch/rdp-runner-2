@@ -111,28 +111,39 @@ jobs:
           $stub = Start-Process $installer -Wait -PassThru
           Write-Host "Installer exit code: $($stub.ExitCode) (7 = handed off, which is normal)"
 
-          # The old 60s probe was far too short: the bootstrapper self-updates first
-          # and then downloads and unpacks the client packages. Watch the whole
-          # install: a healthy install either has an installer process alive or the
-          # %LOCALAPPDATA%\Roblox tree growing, so when it stops doing both it has
-          # given up - report that instead of polling the full timeout.
-          $rbx = "$env:LOCALAPPDATA\Roblox"
-          $versions = "$rbx\Versions"
+          # Where the player lands depends on how the installer ran. Its own log says
+          # "Installer runs as administrator" on this runner, and an elevated install
+          # goes to C:\Program Files\Roblox\Versions\<version GUID> - *not* to
+          # %LOCALAPPDATA%\Roblox\Versions. Probing only LocalAppData reported a
+          # perfectly good install as "not found".
+          $roots = @(
+            "$env:LOCALAPPDATA\Roblox"
+            "$env:ProgramFiles\Roblox"
+            "${env:ProgramFiles(x86)}\Roblox"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          # The bootstrapper self-updates first and then downloads and unpacks the
+          # client packages, so wait for the real install: a healthy install either
+          # has an installer process alive or the tree growing. Once it stops doing
+          # both it is finished (or has given up), so re-check instead of polling on.
           $deadline = (Get-Date).AddSeconds([int]$env:INSTALL_TIMEOUT_SEC)
           $player = $null
           $lastBytes = -1
           $lastGrowth = Get-Date
           while (-not $player -and (Get-Date) -lt $deadline) {
-            $player = Get-ChildItem $versions -Recurse -Filter 'RobloxPlayerBeta.exe' -ErrorAction SilentlyContinue |
-                      Select-Object -First 1
+            $player = Get-ChildItem $roots -Recurse -Filter 'RobloxPlayerBeta.exe' -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($player) { break }
             $busy = @(Get-Process RobloxPlayerInstaller, RobloxPlayerInstallerBootstrapper, RobloxPlayerLauncher -ErrorAction SilentlyContinue).Count
-            $sum = (Get-ChildItem $rbx -Recurse -File -ErrorAction SilentlyContinue |
-                    Measure-Object -Property Length -Sum).Sum
-            $bytes = if ($sum) { $sum } else { 0 }
+            $bytes = 0
+            foreach ($root in $roots) {
+              $sum = (Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
+                      Measure-Object -Property Length -Sum).Sum
+              if ($sum) { $bytes += $sum }
+            }
             if ($bytes -ne $lastBytes) { $lastBytes = $bytes; $lastGrowth = Get-Date }
             $idle = [int]((Get-Date) - $lastGrowth).TotalSeconds
-            Write-Host ("waiting: {0:mm\:ss} left | installer processes: {1} | {2} MB under %LOCALAPPDATA%\Roblox | idle {3}s" -f
+            Write-Host ("waiting: {0:mm\:ss} left | installer processes: {1} | {2} MB on disk | idle {3}s" -f
                         ($deadline - (Get-Date)), $busy, [math]::Round($bytes / 1MB, 1), $idle)
             if ($busy -eq 0 -and $idle -ge 90) {
               Write-Host "no installer process and no progress for ${idle}s - the install has given up"
@@ -144,28 +155,31 @@ jobs:
           if (-not $player) {
             # Leave the evidence next to the report the always()-upload step reads.
             # Roblox's own installer log is the only place that says *why* it quit.
-            Copy-Item "$rbx\logs" "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
-            @(
-              "Roblox Player install did not complete"
+            Copy-Item "$env:LOCALAPPDATA\Roblox\logs" "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
+            $lines = @(
+              "Roblox Player install did not produce RobloxPlayerBeta.exe"
               "Installer exit code  : $($stub.ExitCode)"
               "Waited               : $env:INSTALL_TIMEOUT_SEC s (or until 90 s with no progress)"
-              "Downloaded           : $([math]::Round($lastBytes / 1MB, 1)) MB under %LOCALAPPDATA%\Roblox"
+              "On disk under roots  : $([math]::Round($lastBytes / 1MB, 1)) MB"
+              "Roots searched       : $($roots -join '; ')"
               ""
               "--- %LOCALAPPDATA%\Roblox\logs\RobloxPlayerInstaller_*.log ---"
-              (Get-Content "$rbx\logs\RobloxPlayerInstaller_*.log" -ErrorAction SilentlyContinue | Out-String)
+              (Get-Content "$env:LOCALAPPDATA\Roblox\logs\RobloxPlayerInstaller_*.log" -ErrorAction SilentlyContinue | Out-String)
               ""
-              "--- Application event log (Roblox / .NET / app errors) ---"
+              "--- Application event log (Roblox / .NET Runtime) ---"
               (Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue |
                  Where-Object { $_.Message -match 'Roblox|\.NET Runtime' } |
                  Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message | Out-String -Width 300)
-              ""
-              "--- %LOCALAPPDATA%\Roblox ---"
-              (Get-ChildItem $rbx -Recurse -ErrorAction SilentlyContinue |
-                 Select-Object FullName, Length, LastWriteTime | Out-String)
-              "--- %TEMP%\Roblox* ---"
-              (Get-ChildItem "$env:TEMP" -Filter 'Roblox*' -ErrorAction SilentlyContinue |
-                 Select-Object Name, Length, LastWriteTime | Out-String)
-            ) | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\roblox-diag.txt"
+            )
+            foreach ($root in $roots) {
+              $lines += "--- $root ---"
+              $lines += (Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue |
+                           Select-Object FullName, Length, LastWriteTime | Out-String)
+            }
+            $lines += "--- %TEMP%\Roblox* ---"
+            $lines += (Get-ChildItem "$env:TEMP" -Filter 'Roblox*' -ErrorAction SilentlyContinue |
+                         Select-Object Name, Length, LastWriteTime | Out-String)
+            $lines | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\roblox-diag.txt"
             throw "RobloxPlayerBeta.exe not found after install (see the roblox-diag artifact)"
           }
           Write-Host "Installed : $($player.FullName)"
@@ -177,22 +191,34 @@ jobs:
         run: |
           $diag = "$env:GITHUB_WORKSPACE\roblox-diag.txt"
           $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $logs = "$env:LOCALAPPDATA\Roblox\logs"
 
-          $before = @(Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue).Count
+          # The installer launches the client itself at the end of the install, so
+          # compare PIDs rather than process counts: a leftover process from that
+          # launch would otherwise let a dead player look alive.
+          $before = @(Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+          Write-Host "RobloxPlayerBeta already running (from the install): $($before -join ', ')"
+
           $p = Start-Process $env:PLAYER_EXE -PassThru
           # A rejected environment dies in well under a second; give a working one
           # time to reach its window.
           Start-Sleep -Seconds 25
-          $procs = @(Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue)
+          $p.Refresh()
+          $alive = @(Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue |
+                     Where-Object { $before -notcontains $_.Id })
 
           $fail = $false
-          if ($procs.Count -gt $before) {
-            $verdict = "PASS - Player is running (PID $($procs.Id -join ', '))"
+          if (-not $p.HasExited) {
+            $verdict = "PASS - Player is running (PID $($p.Id))"
+          }
+          elseif ($alive.Count -gt 0) {
+            # The launcher handed off to a fresh process - still a pass.
+            $verdict = "PASS - Player is running (PID $($alive.Id -join ', '))"
           }
           else {
             $fail = $true
             $code = 0
-            try { $p.Refresh(); $code = $p.ExitCode } catch {}
+            try { $code = $p.ExitCode } catch {}
             # NB: in PowerShell 0xFFFFFFFF parses as Int32 -1, so a "-band 0xFFFFFFFF"
             # mask is a no-op (it prints 0xFFFFFFFFC0000409). Mask via BitConverter.
             $hex = '0x{0:X8}' -f ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$code), 0))
@@ -208,11 +234,20 @@ jobs:
           $lines += "VERDICT : $verdict"
           $lines += ""
           $lines += "--- %LOCALAPPDATA%\Roblox\logs ---"
-          $lines += (Get-ChildItem "$env:LOCALAPPDATA\Roblox\logs" -ErrorAction SilentlyContinue |
+          $lines += (Get-ChildItem $logs -ErrorAction SilentlyContinue |
                      Select-Object Name, Length, LastWriteTime | Out-String)
+          # The client's own log usually says what killed it, so keep the tail.
+          $clientLog = Get-ChildItem "$logs\*_last.log", "$logs\*.log" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -notlike 'RobloxPlayerInstaller*' } |
+                       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($clientLog) {
+            $lines += ""
+            $lines += "--- tail of $($clientLog.Name) ---"
+            $lines += (Get-Content $clientLog.FullName -Tail 40 -ErrorAction SilentlyContinue | Out-String)
+          }
           $lines | Set-Content -LiteralPath $diag
           # keep the logs next to the report for the artifact step
-          Copy-Item "$env:LOCALAPPDATA\Roblox\logs" "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item $logs "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
 
           $lines -join [Environment]::NewLine | Write-Host
           "VERDICT : $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
