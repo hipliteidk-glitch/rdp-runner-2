@@ -112,39 +112,61 @@ jobs:
           Write-Host "Installer exit code: $($stub.ExitCode) (7 = handed off, which is normal)"
 
           # The old 60s probe was far too short: the bootstrapper self-updates first
-          # and then downloads and unpacks the client packages, which takes minutes.
-          # Poll for the player while printing progress, so a real hang is obvious
-          # instead of looking like a plain 'not found'.
-          $versions = "$env:LOCALAPPDATA\Roblox\Versions"
+          # and then downloads and unpacks the client packages. Watch the whole
+          # install: a healthy install either has an installer process alive or the
+          # %LOCALAPPDATA%\Roblox tree growing, so when it stops doing both it has
+          # given up - report that instead of polling the full timeout.
+          $rbx = "$env:LOCALAPPDATA\Roblox"
+          $versions = "$rbx\Versions"
           $deadline = (Get-Date).AddSeconds([int]$env:INSTALL_TIMEOUT_SEC)
           $player = $null
+          $lastBytes = -1
+          $lastGrowth = Get-Date
           while (-not $player -and (Get-Date) -lt $deadline) {
             $player = Get-ChildItem $versions -Recurse -Filter 'RobloxPlayerBeta.exe' -ErrorAction SilentlyContinue |
                       Select-Object -First 1
             if ($player) { break }
             $busy = @(Get-Process RobloxPlayerInstaller, RobloxPlayerInstallerBootstrapper, RobloxPlayerLauncher -ErrorAction SilentlyContinue).Count
-            $bytes = (Get-ChildItem $versions -Recurse -File -ErrorAction SilentlyContinue |
-                      Measure-Object -Property Length -Sum).Sum
-            $mb = if ($bytes) { [math]::Round($bytes / 1MB, 1) } else { 0 }
-            Write-Host ("waiting: {0:mm\:ss} left | installer/launcher processes: {1} | Versions on disk: {2} MB" -f
-                        ($deadline - (Get-Date)), $busy, $mb)
+            $sum = (Get-ChildItem $rbx -Recurse -File -ErrorAction SilentlyContinue |
+                    Measure-Object -Property Length -Sum).Sum
+            $bytes = if ($sum) { $sum } else { 0 }
+            if ($bytes -ne $lastBytes) { $lastBytes = $bytes; $lastGrowth = Get-Date }
+            $idle = [int]((Get-Date) - $lastGrowth).TotalSeconds
+            Write-Host ("waiting: {0:mm\:ss} left | installer processes: {1} | {2} MB under %LOCALAPPDATA%\Roblox | idle {3}s" -f
+                        ($deadline - (Get-Date)), $busy, [math]::Round($bytes / 1MB, 1), $idle)
+            if ($busy -eq 0 -and $idle -ge 90) {
+              Write-Host "no installer process and no progress for ${idle}s - the install has given up"
+              break
+            }
             Start-Sleep 10
           }
 
           if (-not $player) {
             # Leave the evidence next to the report the always()-upload step reads.
+            # Roblox's own installer log is the only place that says *why* it quit.
+            Copy-Item "$rbx\logs" "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
             @(
-              "Roblox Player install did not complete within $env:INSTALL_TIMEOUT_SEC s"
+              "Roblox Player install did not complete"
               "Installer exit code  : $($stub.ExitCode)"
+              "Waited               : $env:INSTALL_TIMEOUT_SEC s (or until 90 s with no progress)"
+              "Downloaded           : $([math]::Round($lastBytes / 1MB, 1)) MB under %LOCALAPPDATA%\Roblox"
+              ""
+              "--- %LOCALAPPDATA%\Roblox\logs\RobloxPlayerInstaller_*.log ---"
+              (Get-Content "$rbx\logs\RobloxPlayerInstaller_*.log" -ErrorAction SilentlyContinue | Out-String)
+              ""
+              "--- Application event log (Roblox / .NET / app errors) ---"
+              (Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Message -match 'Roblox|\.NET Runtime' } |
+                 Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message | Out-String -Width 300)
               ""
               "--- %LOCALAPPDATA%\Roblox ---"
-              (Get-ChildItem "$env:LOCALAPPDATA\Roblox" -Recurse -ErrorAction SilentlyContinue |
+              (Get-ChildItem $rbx -Recurse -ErrorAction SilentlyContinue |
                  Select-Object FullName, Length, LastWriteTime | Out-String)
               "--- %TEMP%\Roblox* ---"
               (Get-ChildItem "$env:TEMP" -Filter 'Roblox*' -ErrorAction SilentlyContinue |
                  Select-Object Name, Length, LastWriteTime | Out-String)
             ) | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\roblox-diag.txt"
-            throw "RobloxPlayerBeta.exe not found after $env:INSTALL_TIMEOUT_SEC s"
+            throw "RobloxPlayerBeta.exe not found after install (see the roblox-diag artifact)"
           }
           Write-Host "Installed : $($player.FullName)"
           Write-Host "Version   : $($player.VersionInfo.ProductVersion)"
