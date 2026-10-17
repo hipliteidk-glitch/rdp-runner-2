@@ -66,12 +66,52 @@ cheapest way to test it is a self-hosted runner on one. The workflow now records
 display adapter, Secure Boot and TPM state in the job log, so the next environment tested
 is directly comparable to these three.
 
-A green gate therefore needs a real x64 **Client-SKU** machine (Windows 10/11) - i.e. a
-self-hosted runner, which is what `runner: self-hosted` and `expect: run` are for. Note
-the workflow is arch-aware: on arm64 it installs Tailscale's **x86** package (Tailscale's
-documented choice for ARM64; the `-arm64.msi` installs and starts its service but the
-node never leaves `NoState`), and it searches `C:\Program Files (ARM)` as well as the
-x64 roots, because Program Files is redirected for a native arm64 process.
+A green gate therefore needs a real x64 **Client-SKU** machine; the two ways to get one are
+in the next section. Note the workflow is arch-aware: on arm64 it installs Tailscale's
+**x86** package (Tailscale's documented choice for ARM64; the `-arm64.msi` installs and
+starts its service but the node never leaves `NoState`), and it searches
+`C:\Program Files (ARM)` as well as the x64 roots, because Program Files is redirected for
+a native arm64 process.
+
+### Two ways to get a green gate
+
+Every *free* hosted image is now measured and dead, so `expect: fail` is the honest
+default. A green gate needs a real x64 Client-SKU machine, and that leaves exactly two
+options - neither of which is a standard hosted runner:
+
+**1. A self-hosted runner on hardware you own** (free). Register a runner on a Windows 10/11
+x64 PC (repo or org Settings -> Actions -> Runners) and dispatch with
+`runner: self-hosted`, `expect: run`. This is the only way to test a machine with a real
+display adapter, which is the one property every environment measured above lacks. Be aware
+the workflow then runs *on that PC*: it enables RDP, installs Tailscale and installs the
+Roblox Player.
+
+**2. A larger runner with the "Base Windows 11 desktop" image** (paid, but cheap per run).
+GitHub's larger runners are not limited to Server SKUs: they can be created with the
+partner image **Base Windows 11 desktop**, i.e. a real x64 Windows 11 **client** SKU cloud
+machine hosted by GitHub. Its GPU counterpart is the only configuration that is client SKU
+*and* x64 *and* has a real GPU. Costs, from GitHub's published rates:
+
+| Configuration | Rate | 1 hour of RDP |
+| --- | --- | --- |
+| Windows 4-core larger runner | $0.022/min | $1.32 |
+| Windows 4-core + 1x Tesla T4 (GPU) | $0.102/min | $6.12 |
+
+Requirements and setup:
+
+1. Larger runners are only available to **organizations** on **GitHub Team**
+   ($4/user/month) or Enterprise Cloud - not to personal accounts - and they are **not
+   free for public repositories**. A card on file and an Actions spending limit above zero
+   are both required.
+2. Org settings -> Actions -> Larger runners -> **New larger runner**: Windows, 4-core,
+   image **Base Windows 11 desktop**; then allow this repository to use it.
+3. Dispatch this workflow with `runner_label: <the runner's name>` and `expect: any` for a
+   first probe (unknown environment: the run records the result and stays green either way).
+4. If the Player survives, you have a real cloud Roblox RDP box at $0.022/min - switch to
+   `expect: run` and keep it.
+5. If it still dies, repeat with a **GPU larger runner** (4-core + Tesla T4, same Windows 11
+   desktop image). If the Player dies there too, then no GitHub-hosted machine of any kind
+   can run it and option 1 is the answer.
 
 ### Using it
 
@@ -79,8 +119,9 @@ x64 roots, because Program Files is redirected for a native arm64 process.
 
 | Input | Meaning |
 | --- | --- |
-| `runner` | `windows-2022`, `windows-latest`, `windows-11-arm` (the client-SKU image), or `self-hosted` |
-| `expect` | `fail` (default - correct for every hosted image) or `run` (a real x64 Client-SKU machine) |
+| `runner` | `windows-2022`, `windows-latest`, `windows-11-arm` (the client-SKU image), `self-hosted`, or any larger runner |
+| `runner_label` | Free text; overrides `runner` when set, so a larger runner can be targeted by name |
+| `expect` | `fail` (default - correct for every free hosted image), `run` (a real x64 Client-SKU machine), or `any` (unknown environment: record the result, stay green) |
 | `keep_alive_minutes` | How long to leave the machine (and its RDP door) up |
 | `hostname` | Tailscale node name (default `gh-roblox-test`); set a unique one for test runs so they cannot steal the address from a machine you are already using |
 

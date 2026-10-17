@@ -37,8 +37,13 @@ name: Roblox Player test (RDP + Tailscale)
 #     two can't be separated from one run).
 # So `expect: fail` is correct for *all three* images. This workflow's value from here on
 # is regression: it goes red the day any hosted image starts letting the Player live.
-# A green gate requires a real x64 Client-SKU machine (self-hosted runner), which is what
-# `expect: run` and the self-hosted option are for.
+# A green gate needs a real x64 Client-SKU machine, which leaves two options:
+#   - a self-hosted runner on hardware you own (`runner: self-hosted`), free;
+#   - a *larger runner* (needs GitHub Team + an org + a card) configured with the
+#     "Base Windows 11 desktop" partner image - real x64 client SKU, $0.022/min - or its
+#     GPU counterpart (1x Tesla T4, $0.102/min), which is the only configuration that is
+#     client SKU *and* x64 *and* has a real display adapter. Target it by name via
+#     `runner_label`. See README "Two ways to get a green gate".
 #
 # CAUTION - `runner: self-hosted` does not run on GitHub's hardware. It runs this whole
 # workflow on *your* machine: it enables RDP, installs Tailscale, and installs the Roblox
@@ -62,14 +67,19 @@ on:
           - windows-2022      # Server 2022 x64 - measured 0xC0000409 (server SKU)
           - windows-latest    # Server 2025 x64 - measured 0xC0000409 (server SKU)
           - windows-11-arm    # Windows 11 Enterprise Arm64 - client SKU, measured 0xC0000409 (x64 under emulation)
-          - self-hosted       # your own x64 Client-SKU (Windows 10/11) box - the only way to get a run
+          - self-hosted       # your own x64 Client-SKU (Windows 10/11) box - the only free way to get a run
         default: windows-2022
+      runner_label:
+        description: 'Override `runner` with any label - e.g. a larger-runner name like win11-client (see README: larger runners can use the Base Windows 11 desktop image)'
+        type: string
+        default: ''
       expect:
         description: 'Result this image is expected to produce (fail = Hyperion kills the Player)'
         type: choice
         options:
-          - fail              # measured baseline on every hosted image
+          - fail              # measured baseline on every free hosted image
           - run               # the correct expectation for a Client-SKU / self-hosted runner
+          - any               # unknown environment: record the result and stay green either way
         default: fail
       keep_alive_minutes:
         description: 'Keep the machine (and RDP) alive for this many minutes'
@@ -85,7 +95,9 @@ permissions:
 
 jobs:
   roblox-test:
-    runs-on: ${{ inputs.runner }}
+    # `runner_label` (free text) wins when set, so a larger runner can be targeted by name
+    # while the dropdown keeps the standard images one click away.
+    runs-on: ${{ inputs.runner_label != '' && inputs.runner_label || inputs.runner }}
     timeout-minutes: 360
     steps:
       - name: Checkout
@@ -104,6 +116,7 @@ jobs:
           # (both hosted Server SKUs, the arm64 client image, and the local Azure VM) has
           # had no GPU - only the Hyper-V video / Remote Display adapter. Without the
           # adapter in the log you cannot tell a SKU rejection from a no-GPU one later.
+          Write-Host "Runner        : $env:RUNNER_NAME"
           Write-Host "--- the box underneath ---"
           Write-Host "CPU           : $((Get-CimInstance Win32_Processor).Name)"
           Write-Host "Cores/Threads : $((Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty NumberOfCores)) / $([Environment]::ProcessorCount)"
@@ -420,16 +433,23 @@ jobs:
           $lines | Where-Object { $_ -match '^(OS|VERDICT|EXPECTED)' } |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          if ($mismatch) {
+          if ($expected -eq 'any') {
+            # A brand-new environment whose outcome nobody can predict yet: record the
+            # measurement instead of calling the honest result a failure.
+            Write-Host "Expectation is 'any' - recorded the result above without judging it."
+          }
+          elseif ($mismatch) {
             throw "Roblox Player gate mismatch: expected '$expected' but got '$got'. $verdict"
           }
-          Write-Host "Result matches the expected '$expected' for this image."
+          else {
+            Write-Host "Result matches the expected '$expected' for this image."
+          }
 
       - name: Upload diagnostics (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: roblox-diag-${{ inputs.runner }}
+          name: roblox-diag-${{ inputs.runner_label != '' && inputs.runner_label || inputs.runner }}
           path: |
             roblox-diag.txt
             roblox-logs
