@@ -95,6 +95,10 @@ on:
         description: 'Tailscale node name - change it so a test run cannot re-register (and disconnect) another live run'
         type: string
         default: gh-roblox-test
+      virtual_display:
+        description: 'Install the Virtual Display Driver first, so the runner has a real monitor (tests whether the missing display adapter is what Hyperion objects to)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -265,6 +269,68 @@ jobs:
           # fatal by design, so clear it.
           $LASTEXITCODE = 0
 
+      - name: Install a virtual display adapter (optional)
+        # Hypothesis under test: every environment that has killed the Player so far had
+        # *no display adapter at all* - only "Microsoft Hyper-V Video". This installs the
+        # Virtual Display Driver (a signed IddCx indirect display driver, so it needs no
+        # test-signing and no reboot) to give the runner a real monitor, and the gate below
+        # then reports whether Hyperion still objects. Nothing here touches the Player or
+        # its anti-cheat; it only gives a headless VM a display.
+        if: ${{ inputs.virtual_display }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+            Write-Host '::warning::Skipping VDD: on ARM64 it needs test-signing and a reboot, which a hosted job cannot survive.'
+            exit 0
+          }
+          $temp = Join-Path $env:TEMP 'VDDInstall'
+          New-Item -ItemType Directory -Path $temp -Force | Out-Null
+          # Both URLs are pinned: the driver build and nefcon are fixed, so this step
+          # cannot quietly change behaviour between runs.
+          Invoke-WebRequest -Uri 'https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip' -OutFile "$temp\nefcon.zip" -UseBasicParsing
+          Invoke-WebRequest -Uri 'https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip' -OutFile "$temp\vdd.zip" -UseBasicParsing
+          Expand-Archive "$temp\nefcon.zip" -DestinationPath $temp -Force
+          Expand-Archive "$temp\vdd.zip" -DestinationPath $temp -Force
+
+          # The .cat carries the SignPath Foundation certificate. Trusting it in
+          # LocalMachine\TrustedPublisher is what lets a signed IDD install without
+          # enabling test-signing (and therefore without a reboot).
+          $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+          $certs.Import([System.IO.File]::ReadAllBytes("$temp\VirtualDisplayDriver\mttvdd.cat"))
+          New-Item -ItemType Directory -Path "$temp\certs" -Force | Out-Null
+          foreach ($c in $certs) {
+            $p = "$temp\certs\$($c.Thumbprint).cer"
+            [System.IO.File]::WriteAllBytes($p, $c.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+            Import-Certificate -FilePath $p -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+          }
+          Write-Host "Trusted $($certs.Count) certificate(s) from the driver catalogue."
+
+          Push-Location $temp
+          & "$temp\x64\nefconw.exe" install '.\VirtualDisplayDriver\MttVDD.inf' 'Root\MttVDD'
+          $nefExit = $LASTEXITCODE
+          Pop-Location
+          Write-Host "nefcon exit code: $nefExit"
+          Start-Sleep -Seconds 10
+
+          # This is the whole point of the step: did a monitor actually appear?
+          $adapters = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+          $shown = ($adapters -join ', ')
+          Write-Host "Display adapters now: $shown"
+          try {
+            Get-PnpDevice -Class Display -ErrorAction Stop |
+              Select-Object Status, FriendlyName, InstanceId | Format-Table -AutoSize | Out-String | Write-Host
+          } catch { Write-Host "Get-PnpDevice unavailable: $($_.Exception.Message)" }
+          "**Virtual display:** nefcon=$nefExit; adapters: $shown" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($shown -notmatch 'MttVDD|Virtual Display') {
+            Write-Host '::warning::No virtual display adapter appeared - the gate below is still testing a headless machine, so a FAIL there does not settle the display-adapter hypothesis.'
+          }
+
+          # Same trap as the Tailscale step: the Actions pwsh wrapper ends with
+          # `exit $LASTEXITCODE`, so a non-zero exit from the native nefconw.exe would
+          # leak out as a step failure and skip the Player test.
+          $LASTEXITCODE = 0
+
       - name: Install Roblox Player
         shell: pwsh
         env:
@@ -415,6 +481,7 @@ jobs:
 
           $lines = @()
           $lines += "OS      : $($cv.ProductName) build $($cv.CurrentBuildNumber).$($cv.UBR)"
+          $lines += "Adapters: $((Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', ')"
           $lines += "Player  : $($env:PLAYER_EXE)"
           $lines += "VERDICT : $verdict"
           $lines += "EXPECTED: $expected ($(if ($mismatch) { 'MISMATCH - investigate' } else { 'as documented' }))"
