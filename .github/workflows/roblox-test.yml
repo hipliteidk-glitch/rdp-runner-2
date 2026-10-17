@@ -29,10 +29,46 @@ name: Roblox Player test (RDP + Tailscale)
 # C:\Program Files\Roblox\Versions\<GUID>), starts, and is killed in ~26 s with no client
 # log; the installer reports `InstallerFailedToLaunchClient` / `wait result: 258`.
 #
-# That result is explained, and it is not "the arm64 VM": Roblox *deliberately* rejects
+# CONCLUSION (source-backed, not inferred): Roblox blocks VMs that have no dedicated GPU.
+# Roblox's own anti-cheat article lists the crash type "Virtual machine detected" with the
+# message "Roblox cannot run inside of a virtual machine." and says "Roblox requires GPU
+# passthrough to function properly within a VM"; a Roblox staff reply on the DevForum states
+# the same rule plainly - "We prevent playing in a VM without a dedicated GPU."
+#     https://en.help.roblox.com/hc/en-us/articles/24275616578708-Anti-cheat-Messages
+#     https://devforum.roblox.com/t/hyperion-crash/2838411?page=2
+#
+# Every *free* GitHub-hosted Windows image is a VM with no GPU at all - the only display
+# adapter is "Microsoft Hyper-V Video", 0 MB - so every one of them is rejected, and the
+# Server-vs-Client SKU question was a red herring. Two measurements on 2026-10-17 back that:
+#   - run 39055360837: installing a signed virtual display adapter first (`virtual_display`)
+#     adds a second adapter ("Virtual Display Driver") and changes nothing - still 0xC0000409;
+#   - the same run shows the death leaves no trace: no Application Error / Windows Error
+#     Reporting event naming Roblox appears within 30 s, so it is a deliberate silent exit
+#     rather than a crash. Reproduced live on the windows-2022 runner in the user's own RDP
+#     session: exit 0xC0000409 after 0.28 s, no WER report, no client log.
+#
+# So `expect: fail` is correct for all three free images, and this workflow's value from here
+# on is regression: it goes red the day any hosted image starts letting the Player live. Only
+# two ways to a green gate remain:
+#   - a *larger runner* with a GPU (needs GitHub Team + an org + a card): 4-core + 1x Tesla
+#     T4 at $0.102/min with the "Base Windows 11 desktop" image. That is the only GitHub
+#     configuration with a dedicated GPU, i.e. the only one matching Roblox's requirement.
+#     The CPU-only larger runner has no GPU, so by the same documented rule it will fail too.
+#     Target a larger runner by name via `runner_label` - see README "Two ways to get a green
+#     gate".
+#   - a self-hosted runner on real hardware with a GPU (`runner: self-hosted`), free.
+```
+
+Then the WER guard.</think>
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="edit">
+<｜DSML｜ parameter name="newString" string="true"># That result is explained, and it is not "the arm64 VM": Roblox *deliberately* rejects
 # x64 code running under emulation, and real Windows-on-ARM laptops fail exactly the same
 # way. Roblox ships no native ARM64 Windows client - the Microsoft Store build is x64-only
 # - so there is no way to run it natively on this image either. See README for the sources.
+# (Note that this image is also a VM with no GPU, so *two* documented blocks apply to it at
+# once and this run cannot separate them - see the CONCLUSION below.)
 #
 # CONCLUSION: every *free* GitHub-hosted Windows image fails, and the two directions fail
 # for different reasons:
@@ -70,10 +106,10 @@ on:
         description: 'Runner image to test'
         type: choice
         options:
-          - windows-2022      # Server 2022 x64 - measured 0xC0000409 (server SKU)
-          - windows-latest    # Server 2025 x64 - measured 0xC0000409 (server SKU)
-          - windows-11-arm    # Windows 11 Enterprise Arm64 - client SKU, measured 0xC0000409 (x64 under emulation)
-          - self-hosted       # your own x64 Client-SKU (Windows 10/11) box - the only free way to get a run
+          - windows-2022      # Server 2022 x64 VM, no GPU - measured 0xC0000409
+          - windows-latest    # Server 2025 x64 VM, no GPU - measured 0xC0000409
+          - windows-11-arm    # Windows 11 Enterprise ARM64 VM, no GPU, x64 emulated - measured 0xC0000409
+          - self-hosted       # your own machine with a real GPU - the only free way to get a run
         default: windows-2022
       runner_label:
         description: 'Override `runner` with any label - e.g. a larger-runner name like win11-client (see README: larger runners can use the Base Windows 11 desktop image)'
@@ -84,7 +120,7 @@ on:
         type: choice
         options:
           - fail              # measured baseline on every free hosted image
-          - run               # the correct expectation for a Client-SKU / self-hosted runner
+          - run               # the correct expectation for a machine with a dedicated GPU
           - any               # unknown environment: record the result and stay green either way
         default: fail
       keep_alive_minutes:
@@ -96,7 +132,7 @@ on:
         type: string
         default: gh-roblox-test
       virtual_display:
-        description: 'Install the Virtual Display Driver first, so the runner has a real monitor (tests whether the missing display adapter is what Hyperion objects to)'
+        description: 'Install the Virtual Display Driver first - measured: adds a second adapter, does not save the Player (see README)
         type: boolean
         default: false
 
@@ -499,17 +535,21 @@ jobs:
             $lines += (Get-Content $clientLog.FullName -Tail 40 -ErrorAction SilentlyContinue | Out-String)
           }
           # The Player dies in ~130 ms, before it gets as far as writing a client log, so the
-          # exit code alone is all we would normally have. Windows Error Reporting still
-          # records *which module* faulted, and that is the difference between "Hyperion
-          # killed it" and "a DLL failed to load" - so give WER a moment and keep the event.
+          # exit code alone is all we would normally have. Windows Error Reporting would
+          # record *which module* faulted, which is the difference between "Hyperion killed
+          # it" and "a DLL failed to load" - but on this image WER names Roblox within 30 s
+          # never, i.e. the Player is ending itself rather than crashing. Only wait when the
+          # Player actually died, so a passing run is not delayed.
           $appErr = @()
-          $werDeadline = (Get-Date).AddSeconds(30)
-          while ($appErr.Count -eq 0 -and (Get-Date) -lt $werDeadline) {
-            $appErr = @(Get-WinEvent -LogName Application -MaxEvents 60 -ErrorAction SilentlyContinue |
-                          Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting|\.NET Runtime' -and
-                                         $_.Message -match 'Roblox' } |
-                          Select-Object -First 3)
-            if ($appErr.Count -eq 0) { Start-Sleep 5 }
+          if ($fail) {
+            $werDeadline = (Get-Date).AddSeconds(30)
+            while ($appErr.Count -eq 0 -and (Get-Date) -lt $werDeadline) {
+              $appErr = @(Get-WinEvent -LogName Application -MaxEvents 60 -ErrorAction SilentlyContinue |
+                            Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting|\.NET Runtime' -and
+                                           $_.Message -match 'Roblox' } |
+                            Select-Object -First 3)
+              if ($appErr.Count -eq 0) { Start-Sleep 5 }
+            }
           }
 
           $lines += ""
@@ -519,7 +559,11 @@ jobs:
                        Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message |
                        Format-List | Out-String -Width 300)
           } else {
-            $lines += "no Application Error / Windows Error Reporting event naming Roblox appeared within 30 s"
+            if ($fail) {
+              $lines += "no Application Error / Windows Error Reporting event naming Roblox appeared within 30 s"
+            } else {
+              $lines += "not checked - the Player survived"
+            }
           }
 
           $lines | Set-Content -LiteralPath $diag

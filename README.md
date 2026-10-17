@@ -39,44 +39,42 @@ client about 400 ms after launch with `0xC0000409`
 Client `0.743.0.7431134` (`version-11f155f3450f4c8e`). Every hosted image is rejected,
 and all three fail with the same signature:
 
-| Image | OS | SKU | Gate result |
-| --- | --- | --- | --- |
-| `windows-2022` | Server 2022 Datacenter 21H2, build 20348.5622 | server | killed, `0xC0000409` |
-| `windows-latest` | Server 2025 Datacenter 24H2, build 26100.33438 | server | killed, `0xC0000409` |
-| `windows-11-arm` | Windows 11 Enterprise 25H2, build 26200.9457, arm64 | **client** | killed, `0xC0000409` |
+| Image | OS | SKU | GPU | Gate result |
+| --- | --- | --- | --- | --- |
+| `windows-2022` | Server 2022 Datacenter 21H2, build 20348.5622 | server | none (`Microsoft Hyper-V Video`, 0 MB) | killed, `0xC0000409` |
+| `windows-latest` | Server 2025 Datacenter 24H2, build 26100.33438 | server | none | killed, `0xC0000409` |
+| `windows-11-arm` | Windows 11 Enterprise 25H2, build 26200.9457, arm64 | **client** | none | killed, `0xC0000409` |
 
-The last row is the one that mattered. `windows-11-arm` is the only hosted image that
-is *not* a Server SKU, so it was the last live hypothesis: if Hyperion's objection were
-the SKU alone, the x64 Player should have survived there. It did not (run 39052640851).
-The Player installed correctly - elevated, into `C:\Program Files\Roblox\Versions\<GUID>`
-- started, and died with the same `0xC0000409` and no client log; the installer logged
-`InstallerFailedToLaunchClient` / `wait result: 258`.
+The last row looked decisive, but the real cause is simpler - and Roblox documents it. Roblox's
+anti-cheat support article lists the crash type **"Virtual machine detected"**, with the user
+message *"Roblox cannot run inside of a virtual machine."*, and states: **"Roblox requires GPU
+passthrough to function properly within a VM."** A Roblox staff reply on the DevForum puts it in
+one line: *"We prevent playing in a VM without a dedicated GPU."*
 
-Why the arm64 row fails is documented, and it is not the VM: Roblox **blocks emulated x64
-on purpose**. It ships no native ARM64 Windows client (the Microsoft Store build is
-x64-only), and people on real Windows-on-ARM laptops - client SKU, real GPU, real display
-adapter - hit the same failure from both the website installer and the Store, with Roblox
-declining to support ARM64. Sources: Roblox DevForum
-[roblox-fails-to-initialise-on-windows-arm64-devices](https://devforum.roblox.com/t/roblox-fails-to-initialise-on-windows-arm64-devices/4768214)
-and
-[resolved-roblox-fails-to-launch-on-arm64-windows-11](https://devforum.roblox.com/t/resolved-roblox-fails-to-launch-on-arm64-windows-11/3410091)
-("disallowing software emulated playing").
+- <https://en.help.roblox.com/hc/en-us/articles/24275616578708-Anti-cheat-Messages>
+- <https://devforum.roblox.com/t/hyperion-crash/2838411?page=2>
 
-So the arm64 run answered "can emulated x64 run" (no, by design) - it did **not** answer
-the SKU question. A genuine x64 Client-SKU machine remains untested, which is exactly what
-the next section is about. The practical conclusion is unchanged, though: **no free
-GitHub-hosted Windows image can run the Roblox Player.**
+Every free GitHub-hosted Windows image is a VM with **no GPU at all** - the only display adapter
+is `Microsoft Hyper-V Video`, 0 MB - so every one of them is rejected out of hand. That is why
+the SKU question was a red herring: the Server/Client difference decides nothing here, the
+missing GPU does. The arm64 row fails for the documented emulated-x64 reason *in addition* to
+this one (`InstallerFailedToLaunchClient` / `wait result: 258`, install itself fine), and that
+single run cannot separate the two.
 
-One caveat on what these results can be attributed to: every environment measured here
-also has **no real display adapter** (a basic/virtual display only), so the failures
-cannot distinguish "rejected because Server SKU / x64 emulation" from "rejected because
-there is no GPU". A real PC with a GPU is therefore still an untested environment, and the
-cheapest way to test it is a self-hosted runner on one. The workflow now records the
-display adapter, Secure Boot and TPM state in the job log, so the next environment tested
-is directly comparable to these three.
+Two measurements back the GPU explanation (both 2026-10-17):
 
-A green gate therefore needs a real x64 **Client-SKU** machine; the two ways to get one are
-in the next section. Note the workflow is arch-aware: on arm64 it installs Tailscale's
+- **A display is not what it wants.** Run 39055360837 installs a signed virtual display adapter
+  *before* the Player runs, so a second adapter really does appear (`Virtual Display Driver`,
+  `ROOT\DISPLAY\0000`) - and the verdict does not move: still `0xC0000409`. Detail below.
+- **The death leaves no trace.** In that same run no `Application Error` / Windows Error
+  Reporting event naming Roblox appears within 30 s, i.e. the Player ends itself instead of
+  crashing. Reproduced live on the `windows-2022` runner inside the RDP session: exit
+  `0xC0000409` after **0.28 s**, no WER report, no client log, no Application-log entry.
+
+So **no free GitHub-hosted Windows image can run the Roblox Player**, and the honest reason is a
+Roblox policy rather than a missing workaround: a VM needs a dedicated GPU. A machine that has
+one is the only environment still untested, and there are exactly two ways to get one - see
+*Two ways to get a green gate* below. Note the workflow is arch-aware: on arm64 it installs Tailscale's
 **x86** package (Tailscale's documented choice for ARM64; the `-arm64.msi` installs and
 starts its service but the node never leaves `NoState`), and it searches
 `C:\Program Files (ARM)` as well as the x64 roots, because Program Files is redirected for
@@ -115,26 +113,23 @@ used: an x64 **client** SKU (every passing-SKU probe so far was emulated on ARM6
 ### Two ways to get a green gate
 
 Every *free* hosted image is now measured and dead, so `expect: fail` is the honest
-default. A green gate needs a real x64 Client-SKU machine, and that leaves exactly two
-options - neither of which is a standard hosted runner:
+default. A green gate needs a machine with a **dedicated GPU** - the one property every
+environment measured above lacks, and the one Roblox names in its own documentation. That
+leaves exactly two options, neither of which is a standard hosted runner:
 
-**1. A self-hosted runner on hardware you own** (free). Register a runner on a Windows 10/11
-x64 PC (repo or org Settings -> Actions -> Runners) and dispatch with
-`runner: self-hosted`, `expect: run`. This is the only way to test a machine with a real
-display adapter, which is the one property every environment measured above lacks. Be aware
-the workflow then runs *on that PC*: it enables RDP, installs Tailscale and installs the
-Roblox Player.
+**1. A larger runner with a GPU** (paid, but cheap per probe). GitHub's larger runners are
+not limited to Server SKUs: they can be created with the partner image **Base Windows 11
+desktop**, i.e. a real x64 Windows 11 **client** SKU cloud machine - and the GPU flavour
+adds a **Tesla T4**. That is the only GitHub configuration with a dedicated GPU, so it is
+the only one that matches Roblox's requirement. Costs, from GitHub's published rates:
 
-**2. A larger runner with the "Base Windows 11 desktop" image** (paid, but cheap per run).
-GitHub's larger runners are not limited to Server SKUs: they can be created with the
-partner image **Base Windows 11 desktop**, i.e. a real x64 Windows 11 **client** SKU cloud
-machine hosted by GitHub. Its GPU counterpart is the only configuration that is client SKU
-*and* x64 *and* has a real GPU. Costs, from GitHub's published rates:
+| Configuration | Rate | 1 hour of RDP | 6-minute probe |
+| --- | --- | --- | --- |
+| Windows 4-core larger runner (no GPU) | $0.022/min | $1.32 | ~$0.13 |
+| Windows 4-core + 1x Tesla T4 (GPU) | $0.102/min | $6.12 | ~$0.61 |
 
-| Configuration | Rate | 1 hour of RDP |
-| --- | --- | --- |
-| Windows 4-core larger runner | $0.022/min | $1.32 |
-| Windows 4-core + 1x Tesla T4 (GPU) | $0.102/min | $6.12 |
+Do **not** spend the probe on the CPU-only larger runner: it has no GPU, so by the
+documented rule it fails exactly like the free images do.
 
 Requirements and setup:
 
@@ -142,15 +137,27 @@ Requirements and setup:
    ($4/user/month) or Enterprise Cloud - not to personal accounts - and they are **not
    free for public repositories**. A card on file and an Actions spending limit above zero
    are both required.
-2. Org settings -> Actions -> Larger runners -> **New larger runner**: Windows, 4-core,
-   image **Base Windows 11 desktop**; then allow this repository to use it.
+2. Org settings -> Actions -> Larger runners -> **New larger runner**: Windows, 4-core, add
+   the **Tesla T4** GPU, image **Base Windows 11 desktop**; allow this repository to use it
+   and note the runner's name.
 3. Dispatch this workflow with `runner_label: <the runner's name>` and `expect: any` for a
    first probe (unknown environment: the run records the result and stays green either way).
-4. If the Player survives, you have a real cloud Roblox RDP box at $0.022/min - switch to
-   `expect: run` and keep it.
-5. If it still dies, repeat with a **GPU larger runner** (4-core + Tesla T4, same Windows 11
-   desktop image). If the Player dies there too, then no GitHub-hosted machine of any kind
-   can run it and option 1 is the answer.
+4. If the Player survives, you have a real cloud Roblox RDP box - switch to `expect: run`,
+   give it a long `keep_alive_minutes` and keep it. This is the outcome the GPU is being
+   paid for.
+5. If it still dies with a dedicated GPU, then no GitHub-hosted machine of any kind can run
+   it and option 2 is the answer.
+
+**2. A self-hosted runner on hardware you own** (free). Register a runner on a Windows 10/11
+x64 PC **with a GPU** (repo or org Settings -> Actions -> Runners) and dispatch with
+`runner: self-hosted`, `expect: run`. This is the free way to test the machine class Roblox
+actually supports. Be aware the workflow then runs *on that PC*: it enables RDP, installs
+Tailscale and installs the Roblox Player there.
+
+One field note worth knowing before you judge a GPU probe: on a GPU-passthrough VM, users
+report the Player tripping when a **monitor is attached to the virtual graphics adapter** -
+only the real GPU should be presenting a display. On a larger runner you do not control
+that, which is exactly what the probe is measuring.
 
 ### Using it
 
@@ -158,9 +165,9 @@ Requirements and setup:
 
 | Input | Meaning |
 | --- | --- |
-| `runner` | `windows-2022`, `windows-latest`, `windows-11-arm` (the client-SKU image), `self-hosted`, or any larger runner |
+| `runner` | `windows-2022`, `windows-latest`, `windows-11-arm` (arm64), `self-hosted`, or any larger runner |
 | `runner_label` | Free text; overrides `runner` when set, so a larger runner can be targeted by name |
-| `expect` | `fail` (default - correct for every free hosted image), `run` (a real x64 Client-SKU machine), or `any` (unknown environment: record the result, stay green) |
+| `expect` | `fail` (default - correct for every free hosted image), `run` (correct for a machine with a dedicated GPU), or `any` (unknown environment: record the result, stay green) |
 | `keep_alive_minutes` | How long to leave the machine (and its RDP door) up |
 | `virtual_display` | `true` installs the Virtual Display Driver before the Player test (measured: it adds a second adapter and does **not** change the verdict) |
 | `hostname` | Tailscale node name (default `gh-roblox-test`); set a unique one for test runs so they cannot steal the address from a machine you are already using |
