@@ -132,6 +132,10 @@ jobs:
           else { Write-Host "::warning::the Tailscale MSI did not register a service" }
 
       - name: Connect Tailscale
+        # Best effort: the tunnel must never stop the Player test from running.
+        # continue-on-error plus the explicit exit-code reset below guarantee the
+        # later steps run even if something here goes wrong.
+        continue-on-error: true
         shell: pwsh
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -177,6 +181,13 @@ jobs:
             "**RDP: not reachable** - Tailscale failed: $($_.Exception.Message)" |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           }
+
+          # The Actions pwsh wrapper finishes with `exit $LASTEXITCODE`, and a native
+          # command that failed inside this step (tailscale ip -4 returns non-zero
+          # when there is no address) would otherwise leak out as a *step* failure -
+          # which is what silently skipped the Player test last time. Nothing here is
+          # fatal by design, so clear it.
+          $LASTEXITCODE = 0
 
       - name: Install Roblox Player
         shell: pwsh
