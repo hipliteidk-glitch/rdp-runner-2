@@ -36,25 +36,34 @@ client about 400 ms after launch with `0xC0000409`
 
 ### Measured baseline
 
-Client `0.743.0.7431134` (`version-11f155f3450f4c8e`). The x64 hosted images are all
-Server SKUs and all of them are rejected:
+Client `0.743.0.7431134` (`version-11f155f3450f4c8e`). Every hosted image is rejected,
+and all three fail with the same signature:
 
 | Image | OS | SKU | Gate result |
 | --- | --- | --- | --- |
 | `windows-2022` | Server 2022 Datacenter 21H2, build 20348.5622 | server | killed, `0xC0000409` |
 | `windows-latest` | Server 2025 Datacenter 24H2, build 26100.33438 | server | killed, `0xC0000409` |
-| `windows-11-arm` | Windows 11 Enterprise, build 26200 | **client** | measured separately - see below |
+| `windows-11-arm` | Windows 11 Enterprise 25H2, build 26200.9457, arm64 | **client** | killed, `0xC0000409` |
 
-An earlier note claimed Server 2022 ran the Player fine; that is not true for this
-build, so the 2022-vs-2025 comparison this workflow was written for is moot. Roblox
-does not support server SKUs of Windows.
+The last row is the one that mattered. `windows-11-arm` is the only hosted image that
+is *not* a Server SKU, so it was the last live hypothesis: if Hyperion's objection were
+the SKU alone, the x64 Player should have survived there. It did not (run 39052640851).
+The Player installed correctly - elevated, into `C:\Program Files\Roblox\Versions\<GUID>`
+- started, and died with the same `0xC0000409` and no client log; the installer logged
+`InstallerFailedToLaunchClient` / `wait result: 258`.
 
-The only hosted image that is not a Server SKU is `windows-11-arm`: GitHub's arm64
-Windows images are Windows 11 Enterprise. It is arm64, so the x64 Player can only
-run there under emulation, and whether Hyperion accepts that is unknown - which is
-exactly why it is worth dispatching. The workflow is arm-aware for it: it fetches
-the arm64 Tailscale package, and it searches `C:\Program Files (ARM)` as well as
-the x64 roots, because Program Files is redirected for a native arm64 process.
+That run cannot separate the two remaining explanations - Hyperion rejecting x64 code
+under emulation, or rejecting the VM underneath - but it does not have to: **no
+GitHub-hosted Windows image can run the Roblox Player.** x64 hosted images are Server
+SKUs and are rejected on SKU; the only client-SKU image is arm64 and is rejected under
+emulation.
+
+A green gate therefore needs a real x64 **Client-SKU** machine (Windows 10/11) - i.e. a
+self-hosted runner, which is what `runner: self-hosted` and `expect: run` are for. Note
+the workflow is arch-aware: on arm64 it installs Tailscale's **x86** package (Tailscale's
+documented choice for ARM64; the `-arm64.msi` installs and starts its service but the
+node never leaves `NoState`), and it searches `C:\Program Files (ARM)` as well as the
+x64 roots, because Program Files is redirected for a native arm64 process.
 
 ### Using it
 
@@ -62,16 +71,16 @@ the x64 roots, because Program Files is redirected for a native arm64 process.
 
 | Input | Meaning |
 | --- | --- |
-| `runner` | `windows-2022`, `windows-latest`, or `windows-11-arm` (the client-SKU image) |
-| `expect` | `fail` (default, hosted Server SKU) or `run` (Client-SKU / self-hosted) |
+| `runner` | `windows-2022`, `windows-latest`, `windows-11-arm` (the client-SKU image), or `self-hosted` |
+| `expect` | `fail` (default - correct for every hosted image) or `run` (a real x64 Client-SKU machine) |
 | `keep_alive_minutes` | How long to leave the machine (and its RDP door) up |
 | `hostname` | Tailscale node name (default `gh-roblox-test`); set a unique one for test runs so they cannot steal the address from a machine you are already using |
 
 The run is **green while the image matches `expect`** and red when it does not, so
 it works as a regression probe: it turns red if a future client starts surviving on
-a Server SKU (then set `expect: run`), or if a known-good image regresses. In every
-case it uploads `roblox-diag-windows-*` containing the verdict, the Roblox installer
-log and any client log, and leaves the machine reachable over Tailscale/RDP.
+any hosted image (then set `expect: run`), or if a known-good image regresses. In
+every case it uploads `roblox-diag-windows-*` containing the verdict, the Roblox
+installer log and any client log, and leaves the machine reachable over Tailscale/RDP.
 
 ### Implementation notes
 

@@ -19,10 +19,32 @@ name: Roblox Player test (RDP + Tailscale)
 # 2022-vs-2025 comparison the workflow was written for is dead.
 #
 # The one hosted image that is *not* a Server SKU is windows-11-arm: GitHub's arm64
-# Windows images are "Windows 11 Enterprise" (client SKU, build 26200). It is arm64
-# though, so the x64 Player can only run there under emulation, and whether
-# Hyperion tolerates that is an open question this workflow can now answer. Hence
-# the arch-aware bits below (arm64 Tailscale package, extra Program Files root).
+# Windows images are "Windows 11 Enterprise" (client SKU, DisplayVersion 25H2, build
+# 26200.9457). The x64 Player can only run there under emulation, and that was the
+# last untested hypothesis for a hosted runner. Measured 2026-10-17 (run 39052640851):
+#
+#   windows-11-arm  Windows 11 Enterprise 25H2 arm64  build 26200.9457 -> 0xC0000409
+#
+# Identical signature to the Server SKUs: the x64 client installs fine (elevated, into
+# C:\Program Files\Roblox\Versions\<GUID>), starts, and is killed in ~26 s with no client
+# log; the installer reports `InstallerFailedToLaunchClient` / `wait result: 258`.
+#
+# CONCLUSION: every GitHub-hosted Windows image fails the same way. Hosted runners are a
+# dead end in both SKU directions:
+#   - x64 hosted images are Server SKUs  -> rejected on SKU.
+#   - the only client-SKU image is arm64  -> the x64 Player runs under emulation, and
+#     Hyperion still kills it (possibly the emulation, possibly the VM underneath; the
+#     two can't be separated from one run).
+# So `expect: fail` is correct for *all three* images. This workflow's value from here on
+# is regression: it goes red the day any hosted image starts letting the Player live.
+# A green gate requires a real x64 Client-SKU machine (self-hosted runner), which is what
+# `expect: run` and the self-hosted option are for.
+#
+# CAUTION - `runner: self-hosted` does not run on GitHub's hardware. It runs this whole
+# workflow on *your* machine: it enables RDP, installs Tailscale, and installs the Roblox
+# Player there. Only pick it for a box you are willing to have modified, and pair it with
+# `expect: run` - the default `expect: fail` will turn the gate red precisely because the
+# Player survived, which is the good outcome there.
 #
 # The `expect` input states the result an image should produce. The run is green
 # while the image matches that expectation and red otherwise - i.e. this is a
@@ -39,14 +61,15 @@ on:
         options:
           - windows-2022      # Server 2022 x64 - measured 0xC0000409 (server SKU)
           - windows-latest    # Server 2025 x64 - measured 0xC0000409 (server SKU)
-          - windows-11-arm    # Windows 11 Enterprise Arm64 - the only CLIENT SKU hosted
+          - windows-11-arm    # Windows 11 Enterprise Arm64 - client SKU, measured 0xC0000409 (x64 under emulation)
+          - self-hosted       # your own x64 Client-SKU (Windows 10/11) box - the only way to get a run
         default: windows-2022
       expect:
         description: 'Result this image is expected to produce (fail = Hyperion kills the Player)'
         type: choice
         options:
-          - fail              # measured baseline on hosted Server SKUs
-          - run               # use for a Client-SKU / self-hosted runner
+          - fail              # measured baseline on every hosted image
+          - run               # the correct expectation for a Client-SKU / self-hosted runner
         default: fail
       keep_alive_minutes:
         description: 'Keep the machine (and RDP) alive for this many minutes'
