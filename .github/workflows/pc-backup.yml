@@ -1,0 +1,64 @@
+name: PC-Backup
+
+# Captures what is installed and configured on the runner (apps, Windows
+# features, services, scheduled tasks, env vars, settings, optionally files)
+# and uploads it as an artifact so it can be restored onto another machine
+# with Restore-PC.ps1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_files:
+        description: 'Also copy personal folders (Desktop, Documents, Downloads, ...)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Backup-PC.ps1
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'PCRestore'
+          $params = @{ Destination = $destination }
+          if ('${{ inputs.include_files }}' -eq 'true') { $params.IncludeFiles = $true }
+
+          ./Backup-PC.ps1 @params
+
+          $backup = Get-ChildItem -LiteralPath $destination -Directory -Filter 'Backup_*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $backup) { throw 'Backup-PC.ps1 did not produce a backup folder' }
+
+          Write-Host "Backup folder: $($backup.FullName)"
+          "BACKUP_DIR=$($backup.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "BACKUP_NAME=$($backup.Name)"   | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Show what was captured
+        shell: pwsh
+        run: |
+          Get-Content -LiteralPath (Join-Path $env:BACKUP_DIR 'manifest.json')
+          "### Backup $env:BACKUP_NAME" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| file | size |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| --- | --- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Get-ChildItem -LiteralPath $env:BACKUP_DIR -Recurse -File |
+            Where-Object { $_.Name -notlike '*.log' } |
+            ForEach-Object {
+              $relative = $_.FullName.Substring($env:BACKUP_DIR.Length + 1)
+              "| $relative | $([math]::Round($_.Length / 1KB, 1)) KB |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
+
+      - name: Upload backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: pc-backup-${{ github.run_id }}
+          path: ${{ env.BACKUP_DIR }}
+          if-no-files-found: error
+          retention-days: 30
