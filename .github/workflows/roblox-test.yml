@@ -5,13 +5,23 @@ name: Roblox Player test (RDP + Tailscale)
 # The Roblox Player ships with Byfron/Hyperion anti-cheat. On an environment it
 # rejects it does not fail with a normal error - it terminates itself ~400 ms
 # after launch with exit code 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN), writes no
-# log, produces no crash dump and shows no message. Roblox's own position:
+# client log, produces no crash dump and shows no message. Roblox's own position:
 #     "We don't officially support server SKUs of Windows."
 #
-# windows-latest is currently Windows Server 2025, where the Player is killed.
-# Server 2022 has been reported to run it fine. Dispatch this workflow once per
-# image and compare - the Verify step prints a PASS/FAIL verdict, and the run
-# goes red on FAIL while still leaving the machine up so you can RDP in.
+# MEASURED BASELINE - client 0.743.0.7431134 (version-11f155f3450f4c8e)
+# ---------------------------------------------------------------------
+# Every GitHub-hosted Windows image is a Server SKU, and both are rejected:
+#
+#   windows-2022     Server 2022 Datacenter 21H2  build 20348.5622  -> 0xC0000409
+#   windows-latest   Server 2025 Datacenter 24H2  build 26100.33438 -> 0xC0000409
+#
+# The old "Server 2022 runs it fine" report does not hold for this build, so the
+# 2022-vs-2025 comparison is dead: no hosted image is expected to pass. The
+# `expect` input therefore states the result this image should produce. The run is
+# green while the image matches that expectation and red otherwise - i.e. this is
+# a regression probe. It turns red if a future client starts surviving on a
+# Server SKU (bump `expect`), or if a known-good image starts killing the Player.
+# Either way the machine is left up, so you can RDP in and look around.
 
 on:
   workflow_dispatch:
@@ -20,9 +30,16 @@ on:
         description: 'Runner image to test'
         type: choice
         options:
-          - windows-2022      # Windows Server 2022 - expected to work
-          - windows-latest    # currently Windows Server 2025 - expected to fail
+          - windows-2022      # Windows Server 2022 - measured 0xC0000409
+          - windows-latest    # Windows Server 2025 - measured 0xC0000409
         default: windows-2022
+      expect:
+        description: 'Result this image is expected to produce (fail = Hyperion kills the Player)'
+        type: choice
+        options:
+          - fail              # measured baseline on hosted Server SKUs
+          - run               # use for a Client-SKU / self-hosted runner
+        default: fail
       keep_alive_minutes:
         description: 'Keep the machine (and RDP) alive for this many minutes'
         type: number
@@ -188,6 +205,9 @@ jobs:
 
       - name: Verify the Player starts (the Hyperion gate)
         shell: pwsh
+        env:
+          # What this image is expected to produce - see the header note.
+          EXPECTED: ${{ inputs.expect }}
         run: |
           $diag = "$env:GITHUB_WORKSPACE\roblox-diag.txt"
           $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
@@ -228,10 +248,19 @@ jobs:
             }
           }
 
+          # The gate is a probe, not a test of the code: on the hosted Server SKUs
+          # the documented baseline *is* a killed player. Compare what happened
+          # against what this image is expected to do, so the run is green while the
+          # image matches its expectation and red when something actually changed.
+          $got = if ($fail) { 'fail' } else { 'run' }
+          $expected = if ($env:EXPECTED) { $env:EXPECTED } else { 'fail' }
+          $mismatch = $got -ne $expected
+
           $lines = @()
           $lines += "OS      : $($cv.ProductName) build $($cv.CurrentBuildNumber).$($cv.UBR)"
           $lines += "Player  : $($env:PLAYER_EXE)"
           $lines += "VERDICT : $verdict"
+          $lines += "EXPECTED: $expected ($(if ($mismatch) { 'MISMATCH - investigate' } else { 'as documented' }))"
           $lines += ""
           $lines += "--- %LOCALAPPDATA%\Roblox\logs ---"
           $lines += (Get-ChildItem $logs -ErrorAction SilentlyContinue |
@@ -250,9 +279,13 @@ jobs:
           Copy-Item $logs "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
 
           $lines -join [Environment]::NewLine | Write-Host
-          "VERDICT : $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $lines | Where-Object { $_ -match '^(OS|VERDICT|EXPECTED)' } |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          if ($fail) { throw "Roblox Player did not start: $verdict" }
+          if ($mismatch) {
+            throw "Roblox Player gate mismatch: expected '$expected' but got '$got'. $verdict"
+          }
+          Write-Host "Result matches the expected '$expected' for this image."
 
       - name: Upload diagnostics (always)
         if: always()
