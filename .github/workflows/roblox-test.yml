@@ -113,24 +113,70 @@ jobs:
           Write-Host "Installing Tailscale for $arch"
           $p = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" -OutFile $p -UseBasicParsing
-          Start-Process msiexec -ArgumentList "/i", "`"$p`"", "/quiet", "/norestart" -Wait
-          Start-Sleep 5
+          # -PassThru so the exit code is actually checked: an MSI that quietly fails
+          # used to be reported as a successful step, and the failure only surfaced
+          # later as an unexplained "no Tailscale IP".
+          $msi = Start-Process msiexec -ArgumentList "/i", "`"$p`"", "/quiet", "/norestart" -Wait -PassThru
+          Write-Host "msiexec exit code: $($msi.ExitCode) (0 = ok, 3010 = reboot needed)"
+          if ($msi.ExitCode -ne 0 -and $msi.ExitCode -ne 3010) {
+            throw "Tailscale MSI failed with exit code $($msi.ExitCode)"
+          }
+          # The CLI talks to this service, so wait for it before trying to connect.
+          $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+          $deadline = (Get-Date).AddSeconds(120)
+          while ((Get-Date) -lt $deadline -and (-not $svc -or $svc.Status -ne 'Running')) {
+            Start-Sleep 3
+            $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+          }
+          if ($svc) { Write-Host "Tailscale service: $($svc.Status)" }
+          else { Write-Host "::warning::the Tailscale MSI did not register a service" }
 
       - name: Connect Tailscale
         shell: pwsh
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
-          # Stable default hostname on purpose: a run-id hostname makes the tailnet
-          # address change on every run, so a saved mstsc address goes stale
-          # immediately. Use the `hostname` input for throwaway runs so they don't
-          # take the name (and the connection) from a machine already in use.
-          & $ts up --authkey=$env:TS_KEY --hostname='${{ inputs.hostname }}' --accept-routes=false --accept-dns=false --reset
-          Start-Sleep 5
-          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
-          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "RDP ready: mstsc /v:$ip"
+          # RDP reachability is best effort here. The point of this workflow is the
+          # Hyperion verdict, so a tunnel that will not come up must not stop the
+          # Player test from running - it is reported loudly instead, and the run
+          # summary says whether the machine is actually reachable.
+          try {
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
+            if (-not (Test-Path $ts)) { throw "tailscale.exe not found - the install step did not complete" }
+            $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
+            Write-Host "Tailscale service: $(if ($svc) { $svc.Status } else { 'not registered' })"
+            # Stable default hostname on purpose: a run-id hostname makes the tailnet
+            # address change on every run, so a saved mstsc address goes stale
+            # immediately. Use the `hostname` input for throwaway runs so they don't
+            # take the name (and the connection) from a machine already in use.
+            & $ts up --authkey=$env:TS_KEY --hostname='${{ inputs.hostname }}' --accept-routes=false --accept-dns=false --reset
+            $upExit = $LASTEXITCODE
+            Write-Host "tailscale up exit code: $upExit"
+
+            # Poll for the address: reading it once straight after `up` turned a slow
+            # start into a null-reference crash instead of a useful error.
+            $ip = $null
+            $deadline = (Get-Date).AddSeconds(90)
+            while (-not $ip -and (Get-Date) -lt $deadline) {
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if ($ip) { $ip = $ip.Trim() } else { Start-Sleep 5 }
+            }
+            if (-not $ip) {
+              Write-Host "--- tailscale status ---"
+              & $ts status
+              Write-Host "--- tailscale service ---"
+              Get-Service Tailscale -ErrorAction SilentlyContinue | Format-List Name, Status, StartType | Out-String
+              throw "tailscale up exited $upExit and no IPv4 address appeared within 90 s"
+            }
+            "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+            Write-Host "RDP ready: mstsc /v:$ip"
+            "**RDP:** ``mstsc /v:$ip``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          catch {
+            Write-Host "::warning::RDP will not be reachable - Tailscale failed: $($_.Exception.Message)"
+            "**RDP: not reachable** - Tailscale failed: $($_.Exception.Message)" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
 
       - name: Install Roblox Player
         shell: pwsh
@@ -328,7 +374,12 @@ jobs:
           KEEP_MIN: ${{ inputs.keep_alive_minutes }}
         run: |
           $min = [Math]::Min([int]$env:KEEP_MIN, 350)
-          Write-Host "RDP: mstsc /v:$env:TAILSCALE_IP  (up for $min minutes)"
+          if ($env:TAILSCALE_IP) {
+            Write-Host "RDP: mstsc /v:$env:TAILSCALE_IP  (up for $min minutes)"
+          }
+          else {
+            Write-Host "::warning::no Tailscale address - the machine is NOT reachable over RDP this run"
+          }
           Write-Host "Launch the Roblox Player from the Start menu inside the session."
           $end = (Get-Date).AddMinutes($min)
           while ((Get-Date) -lt $end) { Write-Host "Alive $env:TAILSCALE_IP"; Start-Sleep 300 }
