@@ -8,29 +8,19 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: Configure RDP
-        shell: pwsh
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
-          Restart-Service TermService -Force -ErrorAction SilentlyContinue
-      - name: Create RDP User
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up RDP (Enable-RDP.ps1)
         shell: pwsh
         env:
           RDP_PASS: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if (-not $env:RDP_PASS) { $env:RDP_PASS = "FNAF4Build2026!Secure#123" }
-          $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
-          try { Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue; Start-Sleep 1 } catch {}
-          New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires -PasswordNeverExpires | Out-Null
-          Enable-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
-          net user RDP $env:RDP_PASS /active:yes
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          Write-Host "RDP User OK - pass: $env:RDP_PASS"
+          $pass = $env:RDP_PASS
+          if (-not $pass) { $pass = "FNAF4Build2026!Secure#123" }
+          ./Enable-RDP.ps1 -User RDP -Password $pass -RecreateUser -Administrators `
+            -Port 3389 -SecurityLayer 0 -FirewallRuleName "RDP-Tailscale" -RestartService -KeepTimeouts
+          Write-Host "RDP user 'RDP' ready, listening on 3389"
       - name: Install Tailscale
         shell: pwsh
         run: |
