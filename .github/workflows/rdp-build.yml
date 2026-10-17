@@ -16,10 +16,25 @@ jobs:
         env:
           RDP_PASS: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $pass = $env:RDP_PASS
-          if (-not $pass) { $pass = "FNAF4Build2026!Secure#123" }
-          ./Enable-RDP.ps1 -User RDP -Password $pass -RecreateUser -Administrators `
-            -Port 3389 -SecurityLayer 0 -FirewallRuleName "RDP-Tailscale" -RestartService -KeepTimeouts
+          $params = @{
+            User             = 'RDP'
+            RecreateUser     = $true
+            Administrators   = $true
+            Port             = 3389
+            SecurityLayer    = 0
+            FirewallRuleName = 'RDP-Tailscale'
+            RestartService   = $true
+            KeepTimeouts     = $true
+          }
+          if ($env:RDP_PASS) {
+            $params.Password = $env:RDP_PASS
+            Write-Host "Using the RDP_PASSWORD secret"
+          }
+          else {
+            $params.GeneratePassword = $true
+            Write-Host "::warning::secrets.RDP_PASSWORD is not set - a random password is generated and printed below. Set the secret to keep a fixed password."
+          }
+          ./Enable-RDP.ps1 @params
           Write-Host "RDP user 'RDP' ready, listening on 3389"
       - name: Install Tailscale
         shell: pwsh

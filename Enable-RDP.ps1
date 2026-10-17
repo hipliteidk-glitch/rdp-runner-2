@@ -171,7 +171,9 @@ if (-not $isAdmin) {
             }
         }
         try {
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arguments -Wait
+            $hostExe = (Get-Process -Id $PID).Path
+            if (-not $hostExe) { $hostExe = 'powershell.exe' }
+            Start-Process -FilePath $hostExe -Verb RunAs -ArgumentList $arguments -Wait
             exit 0
         }
         catch {
@@ -199,7 +201,9 @@ if ($GeneratePassword) {
 
 $isDomainController = $false
 try {
-    $isDomainController = (Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4
+    # registry check instead of Win32_ComputerSystem: WMI can be slow or wedged
+    $productType = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions' -Name ProductType -ErrorAction Stop).ProductType
+    $isDomainController = ($productType -eq 'LanmanNT')
 }
 catch {
     Write-Log "Could not read the machine role: $($_.Exception.Message)" 'WARN'
@@ -264,7 +268,7 @@ else {
         if ($PSCmdlet.ShouldProcess("local user '$User'", 'Reset password')) {
             try {
                 $secure = ConvertTo-SecureString $Password -AsPlainText -Force
-                Set-LocalUser -Name $User -Password $secure -PasswordNeverExpires -ErrorAction Stop
+                Set-LocalUser -Name $User -Password $secure -PasswordNeverExpires $true -ErrorAction Stop
                 Write-Log "Password reset for '$User'" 'OK'
             }
             catch {
@@ -311,6 +315,24 @@ if (-not $isDomainController) {
         catch {
             Write-Log "Adding '$User' to Remote Desktop Users failed: $($_.Exception.Message)" 'WARN'
         }
+    }
+
+    # a locked out account cannot sign in over RDP; stale clients lock accounts fast
+    try {
+        $local = [ADSI]"WinNT://$env:COMPUTERNAME/$User,user"
+        if ($local.IsAccountLocked) {
+            if ($PSCmdlet.ShouldProcess("local user '$User'", 'Unlock')) {
+                $local.IsAccountLocked = $false
+                $local.SetInfo()
+                Write-Log "Account '$User' was locked out - unlocked" 'OK'
+            }
+        }
+        else {
+            Write-Log "Account '$User' is not locked out"
+        }
+    }
+    catch {
+        Write-Log "Checking the lockout state of '$User' failed: $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -422,35 +444,28 @@ if (-not $KeepTimeouts) {
 # ------------------------------------------------------------------
 if ($PSCmdlet.ShouldProcess("inbound TCP $Port", 'Allow in firewall')) {
     $ruleName = if ($FirewallRuleName) { $FirewallRuleName } else { "RDP-$Port" }
+    # netsh instead of New-NetFirewallRule: the Net* cmdlets go through CIM,
+    # which is slow or unavailable on some machines.
     try {
-        if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-            $null = New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -Profile Any -Description 'Remote Desktop (added by Enable-RDP.ps1)' -ErrorAction Stop
-            Write-Log "Firewall rule '$ruleName' created" 'OK'
+        $null = & netsh.exe advfirewall firewall show rule name="$ruleName" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $null = & netsh.exe advfirewall firewall add rule name="$ruleName" dir=in action=allow protocol=TCP localport=$Port profile=any 2>&1
+            if ($LASTEXITCODE -eq 0) { Write-Log "Firewall rule '$ruleName' created (inbound TCP $Port)" 'OK' }
+            else { Write-Log "Creating firewall rule '$ruleName' failed (netsh exit code $LASTEXITCODE)" 'ERROR' }
         }
         else {
             Write-Log "Firewall rule '$ruleName' already exists"
         }
     }
     catch {
-        Write-Log "Creating firewall rule '$ruleName' failed: $($_.Exception.Message)" 'ERROR'
+        Write-Log "Firewall rule '$ruleName' failed: $($_.Exception.Message)" 'ERROR'
     }
 
     # built-in rules, so the standard port works even if the group is localized
     try {
-        $builtin = @(Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue)
-        if ($builtin.Count -gt 0) {
-            $disabled = @($builtin | Where-Object { -not $_.Enabled -or $_.Enabled -eq 'False' })
-            if ($disabled.Count -gt 0) {
-                $disabled | Enable-NetFirewallRule -ErrorAction SilentlyContinue
-                Write-Log "Enabled $($disabled.Count) built-in Remote Desktop firewall rule(s)" 'OK'
-            }
-            else {
-                Write-Log "Built-in Remote Desktop firewall rules already enabled ($($builtin.Count))"
-            }
-        }
-        else {
-            Write-Log 'Built-in "Remote Desktop" rule group not found - the custom rule above is what matters' 'WARN'
-        }
+        $null = & netsh.exe advfirewall firewall set rule group="Remote Desktop" new enable=Yes 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Log 'Built-in Remote Desktop firewall rules enabled' 'OK' }
+        else { Write-Log 'Built-in "Remote Desktop" rule group not found (localized name?) - the custom rule above covers the port' 'WARN' }
     }
     catch {
         Write-Log "Enabling the built-in Remote Desktop rules failed: $($_.Exception.Message)" 'WARN'
@@ -510,12 +525,23 @@ Write-Host ("  Machine       : {0}" -f $env:COMPUTERNAME)
 
 $addresses = @()
 try {
-    $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.IPAddress -notlike '127.*' -and $_.AddressState -eq 'Preferred' } |
-        Select-Object -ExpandProperty IPAddress)
+    # DNS first: Get-NetIPAddress needs CIM, which can be slow or unavailable
+    $addresses = @([System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
+        Where-Object { $_.AddressFamily -eq 'InterNetwork' -and $_.IPAddressToString -notlike '127.*' } |
+        Select-Object -ExpandProperty IPAddressToString)
 }
 catch {
-    Write-Log "Could not list IP addresses: $($_.Exception.Message)" 'WARN'
+    Write-Log "Could not list IP addresses with DNS: $($_.Exception.Message)" 'WARN'
+}
+if ($addresses.Count -eq 0 -and (Get-Command Get-WmiObject -ErrorAction SilentlyContinue)) {
+    try {
+        $addresses = @(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = True' -ErrorAction Stop |
+            ForEach-Object { $_.IPAddress } |
+            Where-Object { $_ -and $_ -notlike '127.*' -and $_ -notlike '*:*' })
+    }
+    catch {
+        Write-Log "Could not list IP addresses with WMI: $($_.Exception.Message)" 'WARN'
+    }
 }
 
 if ($addresses.Count -gt 0) {
@@ -529,6 +555,22 @@ if ($generated) {
     Write-Host ''
     Write-Host ("  Generated password for '{0}': {1}" -f $User, $generated) -ForegroundColor Yellow
     Write-Host '  Save it now - it is not stored anywhere.' -ForegroundColor Yellow
+    if (-not $env:CI -and -not $env:GITHUB_ACTIONS) {
+        # an interactive run has no log to scroll back to, so keep a copy on disk
+        try {
+            $passwordFile = Join-Path $env:TEMP 'Enable-RDP-generated-password.txt'
+            @(
+                "Machine : $env:COMPUTERNAME"
+                "User    : $User"
+                "Password: $generated"
+                "Created : $(Get-Date -Format o)"
+            ) | Set-Content -LiteralPath $passwordFile -Encoding UTF8
+            Write-Host "  Also written to $passwordFile - delete it once you have it." -ForegroundColor Yellow
+        }
+        catch {
+            Write-Log "Could not save the generated password to disk: $($_.Exception.Message)" 'WARN'
+        }
+    }
 }
 if ($WhatIfPreference) {
     Write-Host ''

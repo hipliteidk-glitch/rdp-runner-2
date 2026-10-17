@@ -258,9 +258,16 @@ if (Test-Path -LiteralPath $tasksCsv) {
                 $xmlPath = Join-Path $TaskDir $row.File
                 if (-not (Test-Path -LiteralPath $xmlPath)) { continue }
                 try {
-                    $xml = Get-Content -LiteralPath $xmlPath -Raw
-                    $null = Register-ScheduledTask -Xml $xml -TaskName $row.TaskName -TaskPath $row.TaskPath -Force -ErrorAction Stop
-                    $restored++
+                    # schtasks.exe instead of Register-ScheduledTask: the module
+                    # goes through CIM, which can be unavailable
+                    $taskFullPath = "$($row.TaskPath)$($row.TaskName)"
+                    $null = & schtasks.exe /create /tn "$taskFullPath" /xml "$xmlPath" /f 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        $restored++
+                    }
+                    else {
+                        Write-Log "Task $taskFullPath not restored (schtasks exit code $LASTEXITCODE)" 'WARN'
+                    }
                 }
                 catch {
                     Write-Log "Task $($row.TaskPath)$($row.TaskName) not restored: $($_.Exception.Message)" 'WARN'
