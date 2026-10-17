@@ -99,18 +99,53 @@ jobs:
 
       - name: Install Roblox Player
         shell: pwsh
+        env:
+          # The stub returns in seconds and the real install runs in a child
+          # process, so the wait has to cover the whole download/assemble phase.
+          INSTALL_TIMEOUT_SEC: 600
         run: |
           $installer = "$env:TEMP\RobloxPlayerInstaller.exe"
           Invoke-WebRequest -Uri 'https://setup.rbxcdn.com/RobloxPlayerInstaller.exe' -OutFile $installer -UseBasicParsing
+          Write-Host "Downloaded installer ($([math]::Round((Get-Item $installer).Length / 1MB, 1)) MB)"
           # Exit code 7 is normal - the installer hands off to a child process.
-          Start-Process $installer -Wait
+          $stub = Start-Process $installer -Wait -PassThru
+          Write-Host "Installer exit code: $($stub.ExitCode) (7 = handed off, which is normal)"
+
+          # The old 60s probe was far too short: the bootstrapper self-updates first
+          # and then downloads and unpacks the client packages, which takes minutes.
+          # Poll for the player while printing progress, so a real hang is obvious
+          # instead of looking like a plain 'not found'.
+          $versions = "$env:LOCALAPPDATA\Roblox\Versions"
+          $deadline = (Get-Date).AddSeconds([int]$env:INSTALL_TIMEOUT_SEC)
           $player = $null
-          for ($i = 0; $i -lt 12 -and -not $player; $i++) {
-            $player = Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter 'RobloxPlayerBeta.exe' -ErrorAction SilentlyContinue |
+          while (-not $player -and (Get-Date) -lt $deadline) {
+            $player = Get-ChildItem $versions -Recurse -Filter 'RobloxPlayerBeta.exe' -ErrorAction SilentlyContinue |
                       Select-Object -First 1
-            if (-not $player) { Start-Sleep 5 }
+            if ($player) { break }
+            $busy = @(Get-Process RobloxPlayerInstaller, RobloxPlayerInstallerBootstrapper, RobloxPlayerLauncher -ErrorAction SilentlyContinue).Count
+            $bytes = (Get-ChildItem $versions -Recurse -File -ErrorAction SilentlyContinue |
+                      Measure-Object -Property Length -Sum).Sum
+            $mb = if ($bytes) { [math]::Round($bytes / 1MB, 1) } else { 0 }
+            Write-Host ("waiting: {0:mm\:ss} left | installer/launcher processes: {1} | Versions on disk: {2} MB" -f
+                        ($deadline - (Get-Date)), $busy, $mb)
+            Start-Sleep 10
           }
-          if (-not $player) { throw 'RobloxPlayerBeta.exe not found after install' }
+
+          if (-not $player) {
+            # Leave the evidence next to the report the always()-upload step reads.
+            @(
+              "Roblox Player install did not complete within $env:INSTALL_TIMEOUT_SEC s"
+              "Installer exit code  : $($stub.ExitCode)"
+              ""
+              "--- %LOCALAPPDATA%\Roblox ---"
+              (Get-ChildItem "$env:LOCALAPPDATA\Roblox" -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object FullName, Length, LastWriteTime | Out-String)
+              "--- %TEMP%\Roblox* ---"
+              (Get-ChildItem "$env:TEMP" -Filter 'Roblox*' -ErrorAction SilentlyContinue |
+                 Select-Object Name, Length, LastWriteTime | Out-String)
+            ) | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\roblox-diag.txt"
+            throw "RobloxPlayerBeta.exe not found after $env:INSTALL_TIMEOUT_SEC s"
+          }
           Write-Host "Installed : $($player.FullName)"
           Write-Host "Version   : $($player.VersionInfo.ProductVersion)"
           "PLAYER_EXE=$($player.FullName)" >> $env:GITHUB_ENV
