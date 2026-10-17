@@ -1,0 +1,185 @@
+name: Roblox Player test (RDP + Tailscale)
+
+# WHY THIS WORKFLOW EXISTS
+# ------------------------
+# The Roblox Player ships with Byfron/Hyperion anti-cheat. On an environment it
+# rejects it does not fail with a normal error - it terminates itself ~400 ms
+# after launch with exit code 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN), writes no
+# log, produces no crash dump and shows no message. Roblox's own position:
+#     "We don't officially support server SKUs of Windows."
+#
+# windows-latest is currently Windows Server 2025, where the Player is killed.
+# Server 2022 has been reported to run it fine. Dispatch this workflow once per
+# image and compare - the Verify step prints a PASS/FAIL verdict, and the run
+# goes red on FAIL while still leaving the machine up so you can RDP in.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner image to test'
+        type: choice
+        options:
+          - windows-2022      # Windows Server 2022 - expected to work
+          - windows-latest    # currently Windows Server 2025 - expected to fail
+        default: windows-2022
+      keep_alive_minutes:
+        description: 'Keep the machine (and RDP) alive for this many minutes'
+        type: number
+        default: 350
+
+permissions:
+  contents: read
+
+jobs:
+  roblox-test:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show the OS we actually got
+        shell: pwsh
+        run: |
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          $os = "$($cv.ProductName) build $($cv.CurrentBuildNumber).$($cv.UBR)"
+          Write-Host "ProductName   : $($cv.ProductName)"
+          Write-Host "DisplayVersion: $($cv.DisplayVersion)"
+          Write-Host "Build         : $($cv.CurrentBuildNumber).$($cv.UBR)"
+          "**OS tested:** $os" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Set up RDP (Enable-RDP.ps1)
+        shell: pwsh
+        env:
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $params = @{
+            User             = 'RDP'
+            RecreateUser     = $true
+            Administrators   = $true
+            Port             = 3389
+            SecurityLayer    = 0
+            FirewallRuleName = 'RDP-Tailscale'
+            RestartService   = $true
+            KeepTimeouts     = $true
+          }
+          if ($env:RDP_PASS) {
+            $params.Password = $env:RDP_PASS
+            Write-Host 'Using the RDP_PASSWORD secret'
+          }
+          else {
+            $params.GeneratePassword = $true
+            Write-Host '::warning::secrets.RDP_PASSWORD is not set - a random password is generated and printed below.'
+          }
+          ./Enable-RDP.ps1 @params
+          Write-Host "RDP user 'RDP' ready, listening on 3389"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $p = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $p -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i", "`"$p`"", "/quiet", "/norestart" -Wait
+          Start-Sleep 5
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
+          # Stable hostname on purpose: a run-id hostname makes the tailnet address
+          # change on every run, so a saved mstsc address goes stale immediately.
+          & $ts up --authkey=$env:TS_KEY --hostname=gh-roblox-test --accept-routes=false --accept-dns=false --reset
+          Start-Sleep 5
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "RDP ready: mstsc /v:$ip"
+
+      - name: Install Roblox Player
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\RobloxPlayerInstaller.exe"
+          Invoke-WebRequest -Uri 'https://setup.rbxcdn.com/RobloxPlayerInstaller.exe' -OutFile $installer -UseBasicParsing
+          # Exit code 7 is normal - the installer hands off to a child process.
+          Start-Process $installer -Wait
+          $player = $null
+          for ($i = 0; $i -lt 12 -and -not $player; $i++) {
+            $player = Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions" -Recurse -Filter 'RobloxPlayerBeta.exe' -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+            if (-not $player) { Start-Sleep 5 }
+          }
+          if (-not $player) { throw 'RobloxPlayerBeta.exe not found after install' }
+          Write-Host "Installed : $($player.FullName)"
+          Write-Host "Version   : $($player.VersionInfo.ProductVersion)"
+          "PLAYER_EXE=$($player.FullName)" >> $env:GITHUB_ENV
+
+      - name: Verify the Player starts (the Hyperion gate)
+        shell: pwsh
+        run: |
+          $diag = "$env:GITHUB_WORKSPACE\roblox-diag.txt"
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+          $before = @(Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue).Count
+          $p = Start-Process $env:PLAYER_EXE -PassThru
+          # A rejected environment dies in well under a second; give a working one
+          # time to reach its window.
+          Start-Sleep -Seconds 25
+          $procs = @(Get-Process RobloxPlayerBeta -ErrorAction SilentlyContinue)
+
+          $fail = $false
+          if ($procs.Count -gt $before) {
+            $verdict = "PASS - Player is running (PID $($procs.Id -join ', '))"
+          }
+          else {
+            $fail = $true
+            $code = 0
+            try { $p.Refresh(); $code = $p.ExitCode } catch {}
+            # NB: in PowerShell 0xFFFFFFFF parses as Int32 -1, so a "-band 0xFFFFFFFF"
+            # mask is a no-op (it prints 0xFFFFFFFFC0000409). Mask via BitConverter.
+            $hex = '0x{0:X8}' -f ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$code), 0))
+            $verdict = "FAIL - Player exited early with $hex"
+            if ($code -eq 0xC0000409) {
+              $verdict += ' = STATUS_STACK_BUFFER_OVERRUN / fail-fast, i.e. the Byfron-Hyperion self-terminate'
+            }
+          }
+
+          $lines = @()
+          $lines += "OS      : $($cv.ProductName) build $($cv.CurrentBuildNumber).$($cv.UBR)"
+          $lines += "Player  : $($env:PLAYER_EXE)"
+          $lines += "VERDICT : $verdict"
+          $lines += ""
+          $lines += "--- %LOCALAPPDATA%\Roblox\logs ---"
+          $lines += (Get-ChildItem "$env:LOCALAPPDATA\Roblox\logs" -ErrorAction SilentlyContinue |
+                     Select-Object Name, Length, LastWriteTime | Out-String)
+          $lines | Set-Content -LiteralPath $diag
+          # keep the logs next to the report for the artifact step
+          Copy-Item "$env:LOCALAPPDATA\Roblox\logs" "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
+
+          $lines -join [Environment]::NewLine | Write-Host
+          "VERDICT : $verdict" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($fail) { throw "Roblox Player did not start: $verdict" }
+
+      - name: Upload diagnostics (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roblox-diag-${{ inputs.runner }}
+          path: |
+            roblox-diag.txt
+            roblox-logs
+          if-no-files-found: ignore
+
+      - name: Keep Alive - RDP available for ${{ inputs.keep_alive_minutes }} minutes
+        if: always()
+        shell: pwsh
+        env:
+          KEEP_MIN: ${{ inputs.keep_alive_minutes }}
+        run: |
+          $min = [Math]::Min([int]$env:KEEP_MIN, 350)
+          Write-Host "RDP: mstsc /v:$env:TAILSCALE_IP  (up for $min minutes)"
+          Write-Host "Launch the Roblox Player from the Start menu inside the session."
+          $end = (Get-Date).AddMinutes($min)
+          while ((Get-Date) -lt $end) { Write-Host "Alive $env:TAILSCALE_IP"; Start-Sleep 300 }

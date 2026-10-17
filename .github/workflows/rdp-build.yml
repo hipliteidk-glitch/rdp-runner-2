@@ -49,7 +49,7 @@ jobs:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
-          & $ts up --authkey=$env:TS_KEY --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes=false --accept-dns=false --reset
+          & $ts up --authkey=$env:TS_KEY --hostname=gh-rdp-builder --accept-routes=false --accept-dns=false --reset
           Start-Sleep 5; $ip = (& $ts ip -4 | Select-Object -First 1).Trim(); echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV; Write-Host "READY $ip"; echo "RDP_IP=$ip" >> $env:GITHUB_ENV
       - name: BUILD R36S FNAF4 PORT INSIDE RDP
         shell: pwsh
