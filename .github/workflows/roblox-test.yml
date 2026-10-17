@@ -29,12 +29,18 @@ name: Roblox Player test (RDP + Tailscale)
 # C:\Program Files\Roblox\Versions\<GUID>), starts, and is killed in ~26 s with no client
 # log; the installer reports `InstallerFailedToLaunchClient` / `wait result: 258`.
 #
-# CONCLUSION: every GitHub-hosted Windows image fails the same way. Hosted runners are a
-# dead end in both SKU directions:
-#   - x64 hosted images are Server SKUs  -> rejected on SKU.
-#   - the only client-SKU image is arm64  -> the x64 Player runs under emulation, and
-#     Hyperion still kills it (possibly the emulation, possibly the VM underneath; the
-#     two can't be separated from one run).
+# That result is explained, and it is not "the arm64 VM": Roblox *deliberately* rejects
+# x64 code running under emulation, and real Windows-on-ARM laptops fail exactly the same
+# way. Roblox ships no native ARM64 Windows client - the Microsoft Store build is x64-only
+# - so there is no way to run it natively on this image either. See README for the sources.
+#
+# CONCLUSION: every *free* GitHub-hosted Windows image fails, and the two directions fail
+# for different reasons:
+#   - x64 hosted images are Server SKUs      -> rejected on SKU.
+#   - the only client-SKU image is arm64     -> the x64 Player must run emulated, and
+#     Roblox blocks emulated x64 outright. Real ARM laptops are affected the same way.
+# So `expect: fail` is correct for *all three* images, and the SKU question is *not* what
+# the arm64 run answered - a genuine x64 Client-SKU machine is still untested.
 # So `expect: fail` is correct for *all three* images. This workflow's value from here on
 # is regression: it goes red the day any hosted image starts letting the Player live.
 # A green gate needs a real x64 Client-SKU machine, which leaves two options:

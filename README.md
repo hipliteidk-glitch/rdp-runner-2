@@ -52,11 +52,20 @@ The Player installed correctly - elevated, into `C:\Program Files\Roblox\Version
 - started, and died with the same `0xC0000409` and no client log; the installer logged
 `InstallerFailedToLaunchClient` / `wait result: 258`.
 
-That run cannot separate the two remaining explanations - Hyperion rejecting x64 code
-under emulation, or rejecting the VM underneath - but it does not have to: **no
-GitHub-hosted Windows image can run the Roblox Player.** x64 hosted images are Server
-SKUs and are rejected on SKU; the only client-SKU image is arm64 and is rejected under
-emulation.
+Why the arm64 row fails is documented, and it is not the VM: Roblox **blocks emulated x64
+on purpose**. It ships no native ARM64 Windows client (the Microsoft Store build is
+x64-only), and people on real Windows-on-ARM laptops - client SKU, real GPU, real display
+adapter - hit the same failure from both the website installer and the Store, with Roblox
+declining to support ARM64. Sources: Roblox DevForum
+[roblox-fails-to-initialise-on-windows-arm64-devices](https://devforum.roblox.com/t/roblox-fails-to-initialise-on-windows-arm64-devices/4768214)
+and
+[resolved-roblox-fails-to-launch-on-arm64-windows-11](https://devforum.roblox.com/t/resolved-roblox-fails-to-launch-on-arm64-windows-11/3410091)
+("disallowing software emulated playing").
+
+So the arm64 run answered "can emulated x64 run" (no, by design) - it did **not** answer
+the SKU question. A genuine x64 Client-SKU machine remains untested, which is exactly what
+the next section is about. The practical conclusion is unchanged, though: **no free
+GitHub-hosted Windows image can run the Roblox Player.**
 
 One caveat on what these results can be attributed to: every environment measured here
 also has **no real display adapter** (a basic/virtual display only), so the failures
