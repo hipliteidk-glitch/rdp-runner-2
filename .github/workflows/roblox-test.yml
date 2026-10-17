@@ -99,6 +99,30 @@ jobs:
           Write-Host "ProductName   : $($cv.ProductName)"
           Write-Host "DisplayVersion: $($cv.DisplayVersion)"
           Write-Host "Build         : $($cv.CurrentBuildNumber).$($cv.UBR)"
+          # Hyperion's objection is not documented anywhere, so record the whole machine
+          # profile, not just the SKU: every environment that has failed the gate so far
+          # (both hosted Server SKUs, the arm64 client image, and the local Azure VM) has
+          # had no GPU - only the Hyper-V video / Remote Display adapter. Without the
+          # adapter in the log you cannot tell a SKU rejection from a no-GPU one later.
+          Write-Host "--- the box underneath ---"
+          Write-Host "CPU           : $((Get-CimInstance Win32_Processor).Name)"
+          Write-Host "Cores/Threads : $((Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty NumberOfCores)) / $([Environment]::ProcessorCount)"
+          Get-CimInstance Win32_ComputerSystem |
+            ForEach-Object { Write-Host "Model         : $($_.Manufacturer) $($_.Model)  (systemType $($_.SystemType))" }
+          $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+          if ($gpus) {
+            Write-Host "Display adapter(s):"
+            $gpus | ForEach-Object { Write-Host ("  - {0}  drv {1}  ({2:N0} MB)" -f $_.Name, $_.DriverVersion, ($_.AdapterRAM / 1MB)) }
+          } else { Write-Host "Display adapter(s): none reported" }
+          # Secure Boot / TPM are the other environment properties Hyperion could be reading.
+          try {
+            $sb = Confirm-SecureBootUEFI -ErrorAction Stop
+            Write-Host "Secure Boot   : $sb"
+          } catch { Write-Host "Secure Boot   : not reported ($($_.Exception.Message))" }
+          try {
+            $tpm = Get-Tpm -ErrorAction Stop
+            Write-Host "TPM           : present=$($tpm.TpmPresent), ready=$($tpm.TpmReady)"
+          } catch { Write-Host "TPM           : not reported ($($_.Exception.Message))" }
           "**OS tested:** $os" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Set up RDP (Enable-RDP.ps1)

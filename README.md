@@ -58,6 +58,14 @@ GitHub-hosted Windows image can run the Roblox Player.** x64 hosted images are S
 SKUs and are rejected on SKU; the only client-SKU image is arm64 and is rejected under
 emulation.
 
+One caveat on what these results can be attributed to: every environment measured here
+also has **no real display adapter** (a basic/virtual display only), so the failures
+cannot distinguish "rejected because Server SKU / x64 emulation" from "rejected because
+there is no GPU". A real PC with a GPU is therefore still an untested environment, and the
+cheapest way to test it is a self-hosted runner on one. The workflow now records the
+display adapter, Secure Boot and TPM state in the job log, so the next environment tested
+is directly comparable to these three.
+
 A green gate therefore needs a real x64 **Client-SKU** machine (Windows 10/11) - i.e. a
 self-hosted runner, which is what `runner: self-hosted` and `expect: run` are for. Note
 the workflow is arch-aware: on arm64 it installs Tailscale's **x86** package (Tailscale's
