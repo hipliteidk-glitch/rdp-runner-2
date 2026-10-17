@@ -10,18 +10,25 @@ name: Roblox Player test (RDP + Tailscale)
 #
 # MEASURED BASELINE - client 0.743.0.7431134 (version-11f155f3450f4c8e)
 # ---------------------------------------------------------------------
-# Every GitHub-hosted Windows image is a Server SKU, and both are rejected:
+# The x64 GitHub-hosted Windows images are all Server SKUs, and all are rejected:
 #
 #   windows-2022     Server 2022 Datacenter 21H2  build 20348.5622  -> 0xC0000409
 #   windows-latest   Server 2025 Datacenter 24H2  build 26100.33438 -> 0xC0000409
 #
 # The old "Server 2022 runs it fine" report does not hold for this build, so the
-# 2022-vs-2025 comparison is dead: no hosted image is expected to pass. The
-# `expect` input therefore states the result this image should produce. The run is
-# green while the image matches that expectation and red otherwise - i.e. this is
-# a regression probe. It turns red if a future client starts surviving on a
-# Server SKU (bump `expect`), or if a known-good image starts killing the Player.
-# Either way the machine is left up, so you can RDP in and look around.
+# 2022-vs-2025 comparison the workflow was written for is dead.
+#
+# The one hosted image that is *not* a Server SKU is windows-11-arm: GitHub's arm64
+# Windows images are "Windows 11 Enterprise" (client SKU, build 26200). It is arm64
+# though, so the x64 Player can only run there under emulation, and whether
+# Hyperion tolerates that is an open question this workflow can now answer. Hence
+# the arch-aware bits below (arm64 Tailscale package, extra Program Files root).
+#
+# The `expect` input states the result an image should produce. The run is green
+# while the image matches that expectation and red otherwise - i.e. this is a
+# regression probe. It turns red the moment reality changes: a client surviving on
+# a Server SKU, or a known-good image starting to kill the Player. Either way the
+# machine is left up, so you can RDP in and look around.
 
 on:
   workflow_dispatch:
@@ -30,8 +37,9 @@ on:
         description: 'Runner image to test'
         type: choice
         options:
-          - windows-2022      # Windows Server 2022 - measured 0xC0000409
-          - windows-latest    # Windows Server 2025 - measured 0xC0000409
+          - windows-2022      # Server 2022 x64 - measured 0xC0000409 (server SKU)
+          - windows-latest    # Server 2025 x64 - measured 0xC0000409 (server SKU)
+          - windows-11-arm    # Windows 11 Enterprise Arm64 - the only CLIENT SKU hosted
         default: windows-2022
       expect:
         description: 'Result this image is expected to produce (fail = Hyperion kills the Player)'
@@ -44,6 +52,10 @@ on:
         description: 'Keep the machine (and RDP) alive for this many minutes'
         type: number
         default: 350
+      hostname:
+        description: 'Tailscale node name - change it so a test run cannot re-register (and disconnect) another live run'
+        type: string
+        default: gh-roblox-test
 
 permissions:
   contents: read
@@ -95,8 +107,12 @@ jobs:
       - name: Install Tailscale
         shell: pwsh
         run: |
+          # The arm64 runner image needs its own package - the MSI refuses to install
+          # a build for the wrong architecture.
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+          Write-Host "Installing Tailscale for $arch"
           $p = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $p -UseBasicParsing
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" -OutFile $p -UseBasicParsing
           Start-Process msiexec -ArgumentList "/i", "`"$p`"", "/quiet", "/norestart" -Wait
           Start-Sleep 5
 
@@ -106,9 +122,11 @@ jobs:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
-          # Stable hostname on purpose: a run-id hostname makes the tailnet address
-          # change on every run, so a saved mstsc address goes stale immediately.
-          & $ts up --authkey=$env:TS_KEY --hostname=gh-roblox-test --accept-routes=false --accept-dns=false --reset
+          # Stable default hostname on purpose: a run-id hostname makes the tailnet
+          # address change on every run, so a saved mstsc address goes stale
+          # immediately. Use the `hostname` input for throwaway runs so they don't
+          # take the name (and the connection) from a machine already in use.
+          & $ts up --authkey=$env:TS_KEY --hostname='${{ inputs.hostname }}' --accept-routes=false --accept-dns=false --reset
           Start-Sleep 5
           $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
@@ -133,11 +151,17 @@ jobs:
           # goes to C:\Program Files\Roblox\Versions\<version GUID> - *not* to
           # %LOCALAPPDATA%\Roblox\Versions. Probing only LocalAppData reported a
           # perfectly good install as "not found".
+          # On arm64 Windows Program Files is redirected for native processes, and an
+          # emulated x64 client lands under "C:\Program Files" regardless, so list the
+          # literal paths too instead of trusting the env vars alone.
           $roots = @(
             "$env:LOCALAPPDATA\Roblox"
             "$env:ProgramFiles\Roblox"
             "${env:ProgramFiles(x86)}\Roblox"
-          ) | Where-Object { $_ -and (Test-Path $_) }
+            'C:\Program Files\Roblox'
+            'C:\Program Files (x86)\Roblox'
+            'C:\Program Files (ARM)\Roblox'
+          ) | Where-Object { $_ } | Select-Object -Unique | Where-Object { Test-Path $_ }
 
           # The bootstrapper self-updates first and then downloads and unpacks the
           # client packages, so wait for the real install: a healthy install either

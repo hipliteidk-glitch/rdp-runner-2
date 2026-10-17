@@ -36,17 +36,25 @@ client about 400 ms after launch with `0xC0000409`
 
 ### Measured baseline
 
-Client `0.743.0.7431134` (`version-11f155f3450f4c8e`). Every GitHub-hosted Windows
-image is a Server SKU and all of them are rejected:
+Client `0.743.0.7431134` (`version-11f155f3450f4c8e`). The x64 hosted images are all
+Server SKUs and all of them are rejected:
 
-| Image | OS | Gate result |
-| --- | --- | --- |
-| `windows-2022` | Server 2022 Datacenter 21H2, build 20348.5622 | killed, `0xC0000409` |
-| `windows-latest` | Server 2025 Datacenter 24H2, build 26100.33438 | killed, `0xC0000409` |
+| Image | OS | SKU | Gate result |
+| --- | --- | --- | --- |
+| `windows-2022` | Server 2022 Datacenter 21H2, build 20348.5622 | server | killed, `0xC0000409` |
+| `windows-latest` | Server 2025 Datacenter 24H2, build 26100.33438 | server | killed, `0xC0000409` |
+| `windows-11-arm` | Windows 11 Enterprise, build 26200 | **client** | measured separately - see below |
 
 An earlier note claimed Server 2022 ran the Player fine; that is not true for this
 build, so the 2022-vs-2025 comparison this workflow was written for is moot. Roblox
 does not support server SKUs of Windows.
+
+The only hosted image that is not a Server SKU is `windows-11-arm`: GitHub's arm64
+Windows images are Windows 11 Enterprise. It is arm64, so the x64 Player can only
+run there under emulation, and whether Hyperion accepts that is unknown - which is
+exactly why it is worth dispatching. The workflow is arm-aware for it: it fetches
+the arm64 Tailscale package, and it searches `C:\Program Files (ARM)` as well as
+the x64 roots, because Program Files is redirected for a native arm64 process.
 
 ### Using it
 
@@ -54,9 +62,10 @@ does not support server SKUs of Windows.
 
 | Input | Meaning |
 | --- | --- |
-| `runner` | `windows-2022` or `windows-latest` |
+| `runner` | `windows-2022`, `windows-latest`, or `windows-11-arm` (the client-SKU image) |
 | `expect` | `fail` (default, hosted Server SKU) or `run` (Client-SKU / self-hosted) |
 | `keep_alive_minutes` | How long to leave the machine (and its RDP door) up |
+| `hostname` | Tailscale node name (default `gh-roblox-test`); set a unique one for test runs so they cannot steal the address from a machine you are already using |
 
 The run is **green while the image matches `expect`** and red when it does not, so
 it works as a regression probe: it turns red if a future client starts surviving on
