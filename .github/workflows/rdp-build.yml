@@ -1,0 +1,121 @@
+name: FNAF4-R36S-Build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:RDP_PASS) { $env:RDP_PASS = "FNAF4Build2026!Secure#123" }
+          $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          try { Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue; Start-Sleep 1 } catch {}
+          New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          Enable-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          net user RDP $env:RDP_PASS /active:yes
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Write-Host "RDP User OK - pass: $env:RDP_PASS"
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $p = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $p -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i", "`"$p`"", "/quiet", "/norestart" -Wait
+          Start-Sleep 5
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
+          & $ts up --authkey=$env:TS_KEY --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes=false --accept-dns=false --reset
+          Start-Sleep 5; $ip = (& $ts ip -4 | Select-Object -First 1).Trim(); echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV; Write-Host "READY $ip"; echo "RDP_IP=$ip" >> $env:GITHUB_ENV
+      - name: BUILD R36S FNAF4 PORT INSIDE RDP
+        shell: pwsh
+        run: |
+          Write-Host "=== Building R36S FNaF4 Port Inside RDP ==="
+          cd $env:USERPROFILE\Desktop
+          Remove-Item -Recurse -Force R36S-FNAF4 -ErrorAction SilentlyContinue
+          mkdir R36S-FNAF4\FNaF4 -Force | Out-Null
+          
+          # Try download real exe from phone server 100.85.112.66:8000 if alive
+          $phoneIP = "100.85.112.66"
+          $downloaded = $false
+          try {
+            Write-Host "Trying phone http://$phoneIP:8000/R36S_FNAF4_REAL_FIXED.zip"
+            Invoke-WebRequest -Uri "http://$phoneIP:8000/R36S_FNAF4_REAL_FIXED.zip" -OutFile R36S_temp.zip -TimeoutSec 30
+            Expand-Archive R36S_temp.zip -DestinationPath R36S_temp -Force
+            if (Test-Path R36S_temp\FNaF4\FNaF4.exe) { Copy-Item R36S_temp\FNaF4\FNaF4.exe R36S-FNAF4\FNaF4\ -Force; $downloaded = $true }
+            elseif (Test-Path R36S_temp\FNaF4.exe) { Copy-Item R36S_temp\FNaF4.exe R36S-FNAF4\FNaF4\ -Force; $downloaded = $true }
+          } catch { Write-Host "Phone not reachable, will check local files" }
+
+          if (-not $downloaded) {
+            if (Test-Path "$env:USERPROFILE\Desktop\FNaF4.exe") { Copy-Item "$env:USERPROFILE\Desktop\FNaF4.exe" R36S-FNAF4\FNaF4\ -Force }
+            elseif (Test-Path "C:\Users\runneradmin\Desktop\FNaF4.exe") { Copy-Item "C:\Users\runneradmin\Desktop\FNaF4.exe" R36S-FNAF4\FNaF4\ -Force }
+            else { 
+              Write-Host "No exe found, creating placeholder - you can replace later"
+              "placeholder - replace with real FNaF4.exe" | Out-File R36S-FNAF4\FNaF4\README.txt
+            }
+          }
+
+          $shContent = @'
+          #!/bin/bash
+          # FNaF4 - PortMaster Wine - R36S
+          PORT_DIR="$(dirname "$0")"
+          cd "$PORT_DIR/FNaF4"
+          $ESUDO chmod 666 /dev/uinput 2>/dev/null || true
+          ./gptokeyb -c "./FNaF4.gptk" &
+          box86 wine FNaF4.exe
+          '@
+          $shContent | Out-File -Encoding utf8NoBOM R36S-FNAF4\FNaF4.sh
+
+          $gptkContent = @'
+          back = "backspace"
+          start = "enter"
+          a = "enter"
+          b = "escape"
+          x = "space"
+          y = "ctrl"
+          up = "up"
+          down = "down"
+          left = "left"
+          right = "right"
+          l1 = "shift"
+          r1 = "ctrl"
+          l2 = "tab"
+          r2 = "alt"
+          '@
+          $gptkContent | Out-File -Encoding utf8NoBOM R36S-FNAF4\FNaF4.gptk
+          Copy-Item R36S-FNAF4\FNaF4.gptk R36S-FNAF4\FNaF4\FNaF4.gptk -Force
+
+          Compress-Archive -Path R36S-FNAF4 -DestinationPath "$env:USERPROFILE\Desktop\R36S_FNAF4_RDP_BUILT.zip" -Force
+          Compress-Archive -Path R36S-FNAF4 -DestinationPath "$env:GITHUB_WORKSPACE\R36S_FNAF4_R36S.zip" -Force
+          Write-Host "=== R36S BUILD DONE ==="
+          dir "$env:USERPROFILE\Desktop\*.zip"
+          dir "$env:GITHUB_WORKSPACE\*.zip"
+      - name: Upload R36S Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: R36S-FNaF4-RDP-Built
+          path: R36S_FNAF4_R36S.zip
+      - name: Keep Alive 6 Hours - RDP $env:TAILSCALE_IP - R36S Built on Desktop
+        shell: pwsh
+        run: |
+          Write-Host "RDP IP: $env:TAILSCALE_IP R36S zip on Desktop ready!"
+          $end = (Get-Date).AddMinutes(350); while ((Get-Date) -lt $end) { Write-Host "Alive $env:TAILSCALE_IP - R36S Built"; Start-Sleep 300 }
