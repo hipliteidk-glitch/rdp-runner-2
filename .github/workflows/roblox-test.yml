@@ -107,12 +107,15 @@ jobs:
       - name: Install Tailscale
         shell: pwsh
         run: |
-          # The arm64 runner image needs its own package - the MSI refuses to install
-          # a build for the wrong architecture.
-          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
-          Write-Host "Installing Tailscale for $arch"
+          # Tailscale's Windows docs say: pick the package for your CPU, and on ARM64
+          # use the x86 build. The -arm64.msi is offered but does not work on the arm64
+          # runner image - it installs, its service runs, `tailscale up` exits 0, and
+          # the node still never leaves NoState. x86 under emulation is the supported
+          # path (and it is what the x64 images already use).
+          $pkg = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'x86' } else { 'amd64' }
+          Write-Host "Installing Tailscale package: tailscale-setup-latest-$pkg.msi"
           $p = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" -OutFile $p -UseBasicParsing
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$pkg.msi" -OutFile $p -UseBasicParsing
           # -PassThru so the exit code is actually checked: an MSI that quietly fails
           # used to be reported as a successful step, and the failure only surfaced
           # later as an unexplained "no Tailscale IP".
@@ -170,6 +173,13 @@ jobs:
               & $ts status
               Write-Host "--- tailscale service ---"
               Get-Service Tailscale -ErrorAction SilentlyContinue | Format-List Name, Status, StartType | Out-String
+              Write-Host "--- tailscaled logs ---"
+              Get-ChildItem 'C:\ProgramData\Tailscale',
+                            'C:\Windows\System32\config\systemprofile\AppData\Local\Tailscale' -Recurse -Filter '*.log' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 3 | ForEach-Object {
+                  Write-Host "### $($_.FullName)"
+                  Get-Content $_.FullName -Tail 30 -ErrorAction SilentlyContinue
+                }
               throw "tailscale up exited $upExit and no IPv4 address appeared within 90 s"
             }
             "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
