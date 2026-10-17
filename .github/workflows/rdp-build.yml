@@ -44,13 +44,44 @@ jobs:
           Start-Process msiexec -ArgumentList "/i", "`"$p`"", "/quiet", "/norestart" -Wait
           Start-Sleep 5
       - name: Connect Tailscale
+        # Best effort: an unreachable machine must not stop the build, but it must be
+        # reported loudly. The old version read the address once, straight after `up`, so a
+        # slow start became a null-reference crash (`.Trim()` on $null) instead of a
+        # readable failure - and the RDP address is the whole product here.
+        continue-on-error: true
         shell: pwsh
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"; if (-not (Test-Path $ts)) { $ts = "$env:ProgramFiles\Tailscale IPN\tailscale.exe" }
           & $ts up --authkey=$env:TS_KEY --hostname=gh-rdp-builder --accept-routes=false --accept-dns=false --reset
-          Start-Sleep 5; $ip = (& $ts ip -4 | Select-Object -First 1).Trim(); echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV; Write-Host "READY $ip"; echo "RDP_IP=$ip" >> $env:GITHUB_ENV
+
+          # Poll for the address instead of reading it once.
+          $ip = $null
+          $deadline = (Get-Date).AddSeconds(90)
+          while (-not $ip -and (Get-Date) -lt $deadline) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($ip) { $ip = $ip.Trim() } else { Start-Sleep 5 }
+          }
+
+          if ($ip) {
+            "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+            "RDP_IP=$ip" >> $env:GITHUB_ENV
+            Write-Host "READY $ip"
+            "**RDP:** ``mstsc /v:$ip``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          } else {
+            Write-Host "::warning::Tailscale came up without an IPv4 address - the machine is not reachable over the tunnel."
+            Write-Host "--- tailscale status ---"
+            & $ts status
+            Write-Host "--- tailscale service ---"
+            Get-Service Tailscale -ErrorAction SilentlyContinue | Format-List Name, Status, StartType | Out-String | Write-Host
+            "**RDP:** no Tailscale address - this machine is not reachable" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+          # The Actions pwsh wrapper ends with `exit $LASTEXITCODE`, and `tailscale ip -4`
+          # exits non-zero when there is no address, which would otherwise leak out as a
+          # *step* failure. Nothing above is fatal by design, so clear it.
+          $LASTEXITCODE = 0
       - name: BUILD R36S FNAF4 PORT INSIDE RDP
         shell: pwsh
         run: |

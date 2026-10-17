@@ -82,32 +82,35 @@ starts its service but the node never leaves `NoState`), and it searches
 `C:\Program Files (ARM)` as well as the x64 roots, because Program Files is redirected for
 a native arm64 process.
 
-### The virtual display hypothesis (`virtual_display: true`)
+### The display-adapter hypothesis - tested, and eliminated
 
 Every environment that has killed the Player so far had **no display adapter at all** - just
-`Microsoft Hyper-V Video`. That is a confound, and it is testable: the workflow can install
-the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (VDD)
-*before* the Player runs, giving the machine a real monitor.
+`Microsoft Hyper-V Video`. That was the most obvious remaining confound, so the workflow can
+install the [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)
+(VDD) *before* the Player runs (`virtual_display: true`).
+
+It installs, and it settles the question. Measured on `windows-latest` in run 39055360837:
+
+| | |
+|---|---|
+| adapter after install | `Microsoft Hyper-V Video, Virtual Display Driver` (`ROOT\DISPLAY\0000`, `OK`) |
+| nefcon | `Device and driver installed successfully` |
+| Player | still `FAIL - Player exited early with 0xC0000409` |
+
+So **having a real monitor is not what Hyperion objects to.** The step stays in the workflow
+because it takes that variable out of every future probe:
 
 - VDD is a signed IddCx indirect display driver, installed via `nefcon` with its SignPath
   certificate trusted in `LocalMachine\TrustedPublisher` - so no test-signing and **no
   reboot**, which matters because a hosted job cannot survive a reboot.
-- The step is best-effort (`continue-on-error`) and records the resulting adapter list in the
-  run summary *and* in `roblox-diag.txt`, so a FAIL can never be misread as "Hyperion rejects
-  a machine that has a monitor".
+- The step is best-effort (`continue-on-error`) and records the adapter list in the run summary
+  *and* in `roblox-diag.txt`, so a FAIL can never be misread as "Hyperion rejects a machine
+  that has a monitor".
 - It is skipped on ARM64, where this driver needs test-signing plus a reboot.
 
-```shell
-gh workflow run roblox-test.yml -f runner=windows-latest -f virtual_display=true \
-  -f expect=fail -f keep_alive_minutes=0 -f hostname=gh-roblox-vdd
-```
-
-Read the result like this:
-
-- run stays **green** (`fail`, as expected) - having a display changed nothing; the missing
-  monitor is not what Hyperion objects to;
-- run goes **red with a MISMATCH** - the Player *survived* on a free hosted runner simply
-  because the machine now has a display, which would be the headline result.
+That leaves exactly two untested variables, and both change at once when the larger runner is
+used: an x64 **client** SKU (every passing-SKU probe so far was emulated on ARM64) and a real
+**GPU**. One larger-runner probe therefore answers it - see the next section.
 
 ### Two ways to get a green gate
 
@@ -159,7 +162,7 @@ Requirements and setup:
 | `runner_label` | Free text; overrides `runner` when set, so a larger runner can be targeted by name |
 | `expect` | `fail` (default - correct for every free hosted image), `run` (a real x64 Client-SKU machine), or `any` (unknown environment: record the result, stay green) |
 | `keep_alive_minutes` | How long to leave the machine (and its RDP door) up |
-| `virtual_display` | `true` installs the Virtual Display Driver before the Player test - see "The virtual display hypothesis" |
+| `virtual_display` | `true` installs the Virtual Display Driver before the Player test (measured: it adds a second adapter and does **not** change the verdict) |
 | `hostname` | Tailscale node name (default `gh-roblox-test`); set a unique one for test runs so they cannot steal the address from a machine you are already using |
 
 The run is **green while the image matches `expect`** and red when it does not, so

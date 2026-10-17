@@ -498,6 +498,30 @@ jobs:
             $lines += "--- tail of $($clientLog.Name) ---"
             $lines += (Get-Content $clientLog.FullName -Tail 40 -ErrorAction SilentlyContinue | Out-String)
           }
+          # The Player dies in ~130 ms, before it gets as far as writing a client log, so the
+          # exit code alone is all we would normally have. Windows Error Reporting still
+          # records *which module* faulted, and that is the difference between "Hyperion
+          # killed it" and "a DLL failed to load" - so give WER a moment and keep the event.
+          $appErr = @()
+          $werDeadline = (Get-Date).AddSeconds(30)
+          while ($appErr.Count -eq 0 -and (Get-Date) -lt $werDeadline) {
+            $appErr = @(Get-WinEvent -LogName Application -MaxEvents 60 -ErrorAction SilentlyContinue |
+                          Where-Object { $_.ProviderName -match 'Application Error|Windows Error Reporting|\.NET Runtime' -and
+                                         $_.Message -match 'Roblox' } |
+                          Select-Object -First 3)
+            if ($appErr.Count -eq 0) { Start-Sleep 5 }
+          }
+
+          $lines += ""
+          $lines += "--- Application event log (faulting module) ---"
+          if ($appErr.Count -gt 0) {
+            $lines += ($appErr |
+                       Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message |
+                       Format-List | Out-String -Width 300)
+          } else {
+            $lines += "no Application Error / Windows Error Reporting event naming Roblox appeared within 30 s"
+          }
+
           $lines | Set-Content -LiteralPath $diag
           # keep the logs next to the report for the artifact step
           Copy-Item $logs "$env:GITHUB_WORKSPACE\roblox-logs" -Recurse -Force -ErrorAction SilentlyContinue
