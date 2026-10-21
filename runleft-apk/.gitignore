@@ -1,0 +1,7 @@
+# build output
+out/
+gen/
+
+# the signed APK is published as a release asset, not in git
+*.apk
+screenshot.png
