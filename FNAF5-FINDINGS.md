@@ -88,6 +88,13 @@ this is Sister Location's **flashing-lights / jumpscare warning screen**, i.e.
 the very first screen the game shows. Text renderer, font, scaling and
 letterboxing all work.
 
+### The captured frame
+
+`captures/fnaf5-warning-screen.png` — the frame `fbgrab` returned with the DRM
+master free. 640x480, 30083 bytes, 1717 distinct colours.
+
+![Sister Location warning screen](captures/fnaf5-warning-screen.png)
+
 ## Root cause of the "black screen"
 
 Not the port. gl4es is running on GBM against `/dev/dri/card0`:
