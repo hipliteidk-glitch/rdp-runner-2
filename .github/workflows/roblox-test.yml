@@ -76,6 +76,12 @@ name: Roblox Player test (RDP + Tailscale)
 # regression probe. It turns red the moment reality changes: a client surviving on
 # a Server SKU, or a known-good image starting to kill the Player. Either way the
 # machine is left up, so you can RDP in and look around.
+#
+# `skip_test: true` turns this workflow into a plain RDP box: the virtual-display,
+# install and gate steps are skipped entirely and the job goes straight to the
+# keep-alive. There is then no Player and no verdict at all, and the run summary
+# says so explicitly - a skipped gate is never reported as a pass. If you never
+# want the Roblox steps in the job at all, use `rdp-build.yml` instead.
 
 on:
   workflow_dispatch:
@@ -111,6 +117,10 @@ on:
         default: gh-roblox-test
       virtual_display:
         description: 'Install the Virtual Display Driver first - measured: adds a second adapter, does not save the Player (see README)'
+        type: boolean
+        default: false
+      skip_test:
+        description: 'Skip the Roblox install + Hyperion gate and go straight to the RDP keep-alive (plain RDP box, no verdict)'
         type: boolean
         default: false
 
@@ -290,7 +300,7 @@ jobs:
         # test-signing and no reboot) to give the runner a real monitor, and the gate below
         # then reports whether Hyperion still objects. Nothing here touches the Player or
         # its anti-cheat; it only gives a headless VM a display.
-        if: ${{ inputs.virtual_display }}
+        if: ${{ !inputs.skip_test && inputs.virtual_display }}
         continue-on-error: true
         shell: pwsh
         run: |
@@ -346,6 +356,7 @@ jobs:
           $LASTEXITCODE = 0
 
       - name: Install Roblox Player
+        if: ${{ !inputs.skip_test }}
         shell: pwsh
         env:
           # The stub returns in seconds and the real install runs in a child
@@ -441,6 +452,7 @@ jobs:
           "PLAYER_EXE=$($player.FullName)" >> $env:GITHUB_ENV
 
       - name: Verify the Player starts (the Hyperion gate)
+        if: ${{ !inputs.skip_test }}
         shell: pwsh
         env:
           # What this image is expected to produce - see the header note.
@@ -565,7 +577,7 @@ jobs:
           }
 
       - name: Upload diagnostics (always)
-        if: always()
+        if: always() && !inputs.skip_test
         uses: actions/upload-artifact@v4
         with:
           name: roblox-diag-${{ inputs.runner_label != '' && inputs.runner_label || inputs.runner }}
@@ -579,8 +591,16 @@ jobs:
         shell: pwsh
         env:
           KEEP_MIN: ${{ inputs.keep_alive_minutes }}
+          TEST_SKIPPED: ${{ inputs.skip_test }}
         run: |
           $min = [Math]::Min([int]$env:KEEP_MIN, 350)
+          if ($env:TEST_SKIPPED -eq 'true') {
+            # No Player was installed and no gate ran, so this run has no verdict at
+            # all. Say so in the summary: a green skip must never read as a green pass.
+            '**Roblox test skipped** (`skip_test: true`) - no install, no gate, no verdict. This run only provides an RDP box.' |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Write-Host '::notice::Roblox test skipped - this run reports no Player verdict.'
+          }
           if ($env:TAILSCALE_IP) {
             Write-Host "RDP: mstsc /v:$env:TAILSCALE_IP  (up for $min minutes)"
           }
